@@ -40,8 +40,8 @@ exports.getFeedMetrics = async (req, res) => {
     const totalShares = parseInt(sharesCountRes.rows[0].count, 10);
     const totalInteractions = totalLikes + totalComments + totalShares;
 
-    const engagementRate = activeUsersCount > 0 
-      ? parseFloat(((totalInteractions / activeUsersCount) * 100).toFixed(1)) 
+    const engagementRate = activeUsersCount > 0
+      ? parseFloat(((totalInteractions / activeUsersCount) * 100).toFixed(1))
       : 0;
 
     // 3. Avg Engagement per Post (interactions / total posts in period)
@@ -66,19 +66,30 @@ exports.getFeedMetrics = async (req, res) => {
 // GET /api/admin/feed/posts
 exports.getFeedPosts = async (req, res) => {
   try {
-    const { role, location, sort, page = 1, limit = 10, unlistedOnly, userId } = req.query;
+    const { role, location, sort, page = 1, limit = 10, unlistedOnly, deletedOnly, userId, likedOnly, commentedOnly } = req.query;
     const offset = (page - 1) * limit;
 
     let whereClauses = [];
     if (!userId) {
       // whereClauses.push("p.created_at >= NOW() - INTERVAL '30 days'");
     }
-    if (unlistedOnly === 'true') {
-      whereClauses.push("p.is_unlisted = true");
-    } else if (unlistedOnly === 'false') {
-      whereClauses.push("p.is_unlisted = false");
+    if (deletedOnly === 'true') {
+      whereClauses.push("(COALESCE(p.is_active, true) = false OR COALESCE(p.is_deleted, false) = true OR COALESCE(p.is_removed, false) = true)");
+    } else {
+      whereClauses.push("(COALESCE(p.is_active, true) = true AND COALESCE(p.is_deleted, false) = false AND COALESCE(p.is_removed, false) = false)");
+      if (unlistedOnly === 'true') {
+        whereClauses.push("p.is_unlisted = true");
+      } else if (unlistedOnly === 'false') {
+        whereClauses.push("p.is_unlisted = false");
+      }
     }
-    
+    if (likedOnly === 'true') {
+      whereClauses.push("EXISTS (SELECT 1 FROM post_likes pl WHERE pl.post_id = p.post_id)");
+    }
+    if (commentedOnly === 'true') {
+      whereClauses.push("EXISTS (SELECT 1 FROM post_comments pc WHERE pc.post_id = p.post_id)");
+    }
+
     let queryParams = [];
     let paramIndex = 1;
 
@@ -123,11 +134,22 @@ exports.getFeedPosts = async (req, res) => {
 
     const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
 
+    const isMostLiked = sort && (sort === 'Most Liked' || sort.toLowerCase().includes('like'));
+    const isMostCommented = sort && (sort === 'Most Commented' || sort.toLowerCase().includes('comment'));
+    const isMostTagged = sort && (sort === 'Most Tagged' || sort.toLowerCase().includes('tag'));
+    const isHighlyReported = sort && (sort === 'Highly Reported' || sort.toLowerCase().includes('report'));
+
     // Sort order
     let orderSql = 'ORDER BY p.created_at DESC, p.post_id DESC';
-    if (sort === 'Most Liked') {
+    if (deletedOnly === 'true') {
+      orderSql = 'ORDER BY COALESCE(p.updated_at, p.created_at) DESC, p.post_id DESC';
+    } else if (isMostLiked) {
       orderSql = 'ORDER BY likes DESC, p.created_at DESC, p.post_id DESC';
-    } else if (sort === 'Highly Reported') {
+    } else if (isMostCommented) {
+      orderSql = 'ORDER BY comments DESC, p.created_at DESC, p.post_id DESC';
+    } else if (isMostTagged) {
+      orderSql = 'ORDER BY tags DESC, p.created_at DESC, p.post_id DESC';
+    } else if (isHighlyReported) {
       orderSql = 'ORDER BY reports DESC, p.created_at DESC, p.post_id DESC';
     }
 
@@ -137,22 +159,37 @@ exports.getFeedPosts = async (req, res) => {
         p.content,
         p.created_at,
         p.is_unlisted AS "isUnlisted",
+        COALESCE(p.is_active, true) AS "isActive",
+        COALESCE(p.is_deleted, false) AS "isDeleted",
+        COALESCE(p.is_removed, false) AS "isRemoved",
+        p.removed_reason AS "removedReason",
         u.full_name AS author,
         u.job_title AS title,
         u.company_name AS company,
         u.location,
         u.avatar_url AS avatar,
-        COALESCE(pm.url, NULL) AS "mediaUrl",
+        COALESCE(pm.first_media_url, NULL) AS "mediaUrl",
+        COALESCE(pm.first_media_type, NULL) AS "mediaType",
+        COALESCE(pm.media_list, '[]'::json) AS "mediaList",
         COALESCE(l.likes_count, 0) AS likes,
         COALESCE(c.comments_count, 0) AS comments,
         COALESCE(s.shares_count, 0) AS shares,
+        COALESCE(tg.tags_count, 0) AS tags,
         COALESCE(r.reports_count, 0) AS reports,
         u.moderation_flags,
         pa.reason AS "appealReason",
         pa.status AS "appealStatus"
       FROM posts p
       JOIN users u ON p.author_id = u.user_id
-      LEFT JOIN post_media pm ON p.post_id = pm.post_id
+      LEFT JOIN (
+        SELECT 
+          post_id,
+          json_agg(json_build_object('url', url, 'media_type', media_type, 'width', width, 'height', height)) AS media_list,
+          (ARRAY_AGG(url))[1] AS first_media_url,
+          (ARRAY_AGG(media_type))[1] AS first_media_type
+        FROM post_media
+        GROUP BY post_id
+      ) pm ON p.post_id = pm.post_id
       LEFT JOIN post_appeals pa ON p.post_id = pa.post_id AND pa.status = 'pending'
       LEFT JOIN (
         SELECT post_id, COUNT(*) AS likes_count FROM post_likes GROUP BY post_id
@@ -163,6 +200,15 @@ exports.getFeedPosts = async (req, res) => {
       LEFT JOIN (
         SELECT post_id, COUNT(*) AS shares_count FROM post_shares GROUP BY post_id
       ) s ON p.post_id = s.post_id
+      LEFT JOIN (
+        SELECT post_id, COUNT(*) AS tags_count 
+        FROM (
+          SELECT post_id FROM post_hashtags
+          UNION ALL
+          SELECT post_id FROM post_tags
+        ) all_tags
+        GROUP BY post_id
+      ) tg ON p.post_id = tg.post_id
       LEFT JOIN (
         SELECT target_id, COUNT(*) AS reports_count FROM reports WHERE target_type = 'post' GROUP BY target_id
       ) r ON p.post_id = r.target_id
@@ -207,17 +253,22 @@ exports.getFeedPosts = async (req, res) => {
       avatar: row.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(row.author)}&background=e0e7ff&color=3730a3`,
       content: row.content,
       mediaUrl: row.mediaUrl,
+      mediaType: row.mediaType,
+      mediaList: row.mediaList || [],
       created_at: row.created_at,
       metrics: {
         likes: parseInt(row.likes, 10),
         comments: parseInt(row.comments, 10),
         shares: parseInt(row.shares, 10),
+        tags: parseInt(row.tags || 0, 10),
         saves: 0,
         clicks: 0
       },
       aiFlag: row.moderation_flags > 2 ? { type: 'safety', message: `High Risk: Author has ${row.moderation_flags} moderation flags.` } : null,
-      status: 'active',
+      status: (!row.isActive || row.isDeleted || row.isRemoved) ? 'deleted' : (row.isUnlisted ? 'unlisted' : 'active'),
       isUnlisted: !!row.isUnlisted,
+      isDeleted: !row.isActive || !!row.isDeleted || !!row.isRemoved,
+      removedReason: row.removedReason || null,
       appeal: row.appealStatus === 'pending' ? {
         reason: row.appealReason,
         status: row.appealStatus
@@ -292,8 +343,8 @@ exports.restoreFeedPost = async (req, res) => {
 
     const post = checkRes.rows[0];
 
-    // Restore: Toggle is_unlisted to false and make it public again
-    await req.db.query("UPDATE posts SET is_unlisted = false, visibility = 'public' WHERE post_id = $1", [id]);
+    // Restore: Toggle is_active to true, is_unlisted to false, is_deleted to false, is_removed to false and make it public again
+    await req.db.query("UPDATE posts SET is_active = true, is_unlisted = false, is_deleted = false, is_removed = false, visibility = 'public' WHERE post_id = $1", [id]);
 
     // Resolve pending appeals as approved
     await req.db.query("UPDATE post_appeals SET status = 'approved', reviewed_at = NOW() WHERE post_id = $1 AND status = 'pending'", [id]);
@@ -491,7 +542,7 @@ exports.createPostComment = async (req, res) => {
     const { id } = req.params;
     const { content, parent_id } = req.body;
     const userId = req.user.sub || req.user.id; // Admin user ID from token
-    
+
     if (!content || !content.trim()) {
       return res.status(400).json({ error: 'Content is required' });
     }
@@ -502,12 +553,12 @@ exports.createPostComment = async (req, res) => {
       RETURNING comment_id AS id, content, created_at, parent_id
     `;
     const result = await req.db.query(insertQuery, [id, userId, content, parent_id || null]);
-    
+
     // Fetch the admin user details to return a complete comment object
     const userQuery = `SELECT full_name, avatar_url, job_title, company_name FROM users WHERE user_id = $1`;
     const userResult = await req.db.query(userQuery, [userId]);
     const u = userResult.rows[0] || {};
-    
+
     const newComment = {
       id: result.rows[0].id,
       content: result.rows[0].content,
@@ -518,7 +569,7 @@ exports.createPostComment = async (req, res) => {
       title: u.job_title || 'Admin',
       company: u.company_name || 'COCPIT'
     };
-    
+
     res.status(201).json(newComment);
   } catch (error) {
     console.error('Error creating post comment:', error);
@@ -585,14 +636,14 @@ exports.getAllChannels = async (req, res) => {
 exports.getChannelArticles = async (req, res) => {
   try {
     const { id } = req.params;
-    
+
     // Check if the channel (community) exists
     const channelQuery = `SELECT org_id FROM communities WHERE community_id = $1 AND is_active = TRUE`;
     const channelResult = await req.db.query(channelQuery, [id]);
     if (channelResult.rows.length === 0) {
       return res.status(404).json({ error: 'Channel not found' });
     }
-    
+
     const orgId = channelResult.rows[0].org_id;
 
     // Fetch articles (posts by the organization)
@@ -610,7 +661,7 @@ exports.getChannelArticles = async (req, res) => {
       ORDER BY p.created_at DESC
     `;
     const articlesResult = await req.db.query(articlesQuery, [orgId]);
-    
+
     // Post process to extract title from content if title is missing
     const articles = articlesResult.rows.map(row => {
       let title = row.title;
@@ -661,7 +712,7 @@ exports.getAllThoughts = async (req, res) => {
       LIMIT $1 OFFSET $2
     `;
     const result = await req.db.query(query, [limit, offset]);
-    
+
     const thoughts = result.rows.map(row => ({
       id: row.id,
       content: row.content,
@@ -670,8 +721,8 @@ exports.getAllThoughts = async (req, res) => {
       author_id: row.author_id,
       post_id: row.post_id,
       avatar: row.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(row.author)}&background=e0e7ff&color=3730a3`,
-      postSnippet: (row.post_snippet && row.post_snippet.length > 50) 
-        ? row.post_snippet.substring(0, 50) + '...' 
+      postSnippet: (row.post_snippet && row.post_snippet.length > 50)
+        ? row.post_snippet.substring(0, 50) + '...'
         : row.post_snippet
     }));
 
@@ -692,7 +743,7 @@ exports.deleteThought = async (req, res) => {
   try {
     const { id } = req.params;
     const result = await req.db.query('DELETE FROM post_comments WHERE comment_id = $1 RETURNING *', [id]);
-    
+
     if (result.rowCount === 0) {
       return res.status(404).json({ error: 'Thought not found' });
     }
@@ -701,6 +752,40 @@ exports.deleteThought = async (req, res) => {
   } catch (error) {
     console.error('Error deleting thought:', error);
     res.status(500).json({ error: 'Failed to delete thought' });
+  }
+};
+
+// GET /api/admin/feed/posts/:id/likes
+exports.getPostLikes = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const query = `
+      SELECT 
+        pl.like_id AS id,
+        pl.created_at,
+        u.user_id AS "userId",
+        u.full_name AS author,
+        u.avatar_url AS avatar,
+        u.job_title AS title,
+        u.company_name AS company
+      FROM post_likes pl
+      JOIN users u ON pl.user_id = u.user_id
+      WHERE pl.post_id = $1
+      ORDER BY pl.created_at DESC
+    `;
+    const result = await req.db.query(query, [id]);
+    res.json(result.rows.map(row => ({
+      id: row.id,
+      userId: row.userId,
+      author: row.author,
+      title: row.title || 'Platform Member',
+      company: row.company || '',
+      avatar: row.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(row.author)}&background=e0e7ff&color=3730a3`,
+      created_at: row.created_at
+    })));
+  } catch (error) {
+    console.error('Error fetching post likes:', error);
+    res.status(500).json({ error: 'Failed to fetch post likes' });
   }
 };
 

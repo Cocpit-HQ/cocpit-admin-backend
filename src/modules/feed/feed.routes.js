@@ -6,6 +6,7 @@ const feedController = require('./feed.controller');
 router.get('/metrics', requireRoles(['Admin', 'Moderator', 'Developer']), feedController.getFeedMetrics);
 router.get('/posts', requireRoles(['Admin', 'Moderator', 'Developer']), feedController.getFeedPosts);
 router.get('/posts/:id', requireRoles(['Admin', 'Moderator', 'Developer']), feedController.getPostById);
+router.get('/posts/:id/likes', requireRoles(['Admin', 'Moderator', 'Developer']), feedController.getPostLikes);
 router.get('/posts/:id/comments', requireRoles(['Admin', 'Moderator', 'Developer']), feedController.getPostComments);
 router.post('/posts/:id/comments', requireRoles(['Admin', 'Moderator', 'Developer']), feedController.createPostComment);
 router.delete('/posts/:id', requireRoles(['Admin', 'Moderator', 'Developer']), feedController.deleteFeedPost);

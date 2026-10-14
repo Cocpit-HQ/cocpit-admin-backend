@@ -17,6 +17,24 @@ const redis = new Redis({
   },
 });
 
+const safeCommands = ['get', 'set', 'setex', 'del', 'publish', 'keys', 'zrem', 'hget', 'hset'];
+safeCommands.forEach((cmd) => {
+  const orig = typeof redis[cmd] === 'function' ? redis[cmd].bind(redis) : null;
+  if (!orig) return;
+  redis[cmd] = async (...args) => {
+    if (redis.status !== 'ready') {
+      if (cmd === 'keys') return [];
+      if (cmd === 'del' || cmd === 'publish' || cmd === 'zrem') return 0;
+      return null;
+    }
+    try {
+      return await orig(...args);
+    } catch (err) {
+      return cmd === 'keys' ? [] : (['del', 'publish', 'zrem'].includes(cmd) ? 0 : null);
+    }
+  };
+});
+
 redis.setEx = async (key, seconds, value) => {
   return redis.set(key, value, 'EX', seconds);
 };

@@ -3,7 +3,14 @@ const redis = require('../../config/redis');
 exports.getDashboardMetrics = async (req, res) => {
   try {
     const cacheKey = `dashboard:metrics:${req.query.startDate || 'default'}:${req.query.endDate || 'default'}`;
-    const cachedData = await redis.get(cacheKey);
+    let cachedData = null;
+    try {
+      if (redis.status === 'ready') {
+        cachedData = await redis.get(cacheKey);
+      }
+    } catch (cacheErr) {
+      // Ignore cache lookup failure
+    }
     if (cachedData) {
       return res.json(JSON.parse(cachedData));
     }
@@ -28,11 +35,14 @@ exports.getDashboardMetrics = async (req, res) => {
     const totalUsersRes = await req.db.query(totalUsersQuery, totalUsersParams);
     const totalUsers = parseInt(totalUsersRes.rows[0].count, 10);
 
-    // 2. Active Users (Active within start and end date)
-    const activeUsersRes = await req.db.query(
-      'SELECT COUNT(*) FROM users WHERE last_active_at >= $1 AND last_active_at <= $2',
-      [start.toISOString(), end.toISOString()]
-    );
+    // 2. Active Users (Users with active status in DB)
+    let activeUsersQuery = 'SELECT COUNT(*) FROM users WHERE (is_suspended IS FALSE OR is_suspended IS NULL) AND (is_deleted IS FALSE OR is_deleted IS NULL) AND (is_deactivated IS FALSE OR is_deactivated IS NULL)';
+    let activeUsersParams = [];
+    if (isCustom) {
+      activeUsersQuery += ' AND created_at >= $1 AND created_at <= $2';
+      activeUsersParams = [start.toISOString(), end.toISOString()];
+    }
+    const activeUsersRes = await req.db.query(activeUsersQuery, activeUsersParams);
     const activeUsers = parseInt(activeUsersRes.rows[0].count, 10);
 
     // 3. User Growth
@@ -55,30 +65,33 @@ exports.getDashboardMetrics = async (req, res) => {
       userGrowth = ((currUsers - prevUsers) / prevUsers) * 100;
     }
 
-    // 4. Total Organizations (All up to now, OR specific range if custom)
-    let totalOrgsQuery = 'SELECT COUNT(*) FROM organizations WHERE is_deleted = FALSE';
+    // 4. Total Organizations (All active in DB)
+    let totalOrgsQuery = 'SELECT COUNT(*) FROM organizations WHERE (is_deleted IS FALSE OR is_deleted IS NULL)';
     let totalOrgsParams = [];
     if (isCustom) {
-      totalOrgsQuery = 'SELECT COUNT(*) FROM organizations WHERE is_deleted = FALSE AND created_at >= $1 AND created_at <= $2';
+      totalOrgsQuery += ' AND created_at >= $1 AND created_at <= $2';
       totalOrgsParams = [start.toISOString(), end.toISOString()];
     }
     const totalOrgsRes = await req.db.query(totalOrgsQuery, totalOrgsParams);
     const totalOrgs = parseInt(totalOrgsRes.rows[0].count, 10);
 
-    // 5. Active Organizations
-    const activeOrgsRes = await req.db.query(
-      'SELECT COUNT(*) FROM organizations WHERE is_deleted = FALSE AND last_active_at >= $1 AND last_active_at <= $2',
-      [start.toISOString(), end.toISOString()]
-    );
+    // 5. Active Organizations (Non-suspended, non-deactivated, non-deleted)
+    let activeOrgsQuery = 'SELECT COUNT(*) FROM organizations WHERE (is_deleted IS FALSE OR is_deleted IS NULL) AND (is_suspended IS FALSE OR is_suspended IS NULL) AND (is_deactivated IS FALSE OR is_deactivated IS NULL)';
+    let activeOrgsParams = [];
+    if (isCustom) {
+      activeOrgsQuery += ' AND created_at >= $1 AND created_at <= $2';
+      activeOrgsParams = [start.toISOString(), end.toISOString()];
+    }
+    const activeOrgsRes = await req.db.query(activeOrgsQuery, activeOrgsParams);
     const activeOrgs = parseInt(activeOrgsRes.rows[0].count, 10);
 
     // 6. Organization Growth
     const newOrgsCurrentRes = await req.db.query(
-      'SELECT COUNT(*) FROM organizations WHERE is_deleted = FALSE AND created_at >= $1 AND created_at <= $2',
+      'SELECT COUNT(*) FROM organizations WHERE (is_deleted IS FALSE OR is_deleted IS NULL) AND created_at >= $1 AND created_at <= $2',
       [start.toISOString(), end.toISOString()]
     );
     const newOrgsPrevRes = await req.db.query(
-      'SELECT COUNT(*) FROM organizations WHERE is_deleted = FALSE AND created_at >= $1 AND created_at <= $2',
+      'SELECT COUNT(*) FROM organizations WHERE (is_deleted IS FALSE OR is_deleted IS NULL) AND created_at >= $1 AND created_at <= $2',
       [prevStart.toISOString(), prevEnd.toISOString()]
     );
 
@@ -95,18 +108,24 @@ exports.getDashboardMetrics = async (req, res) => {
     if (userGrowth < 0) userGrowth = 0;
     if (orgGrowth < 0) orgGrowth = 0;
 
-    // 7. Suspended & Deleted Users
-    const suspendedUsersRes = await req.db.query('SELECT COUNT(*) FROM users WHERE is_suspended = TRUE');
+    // 7. Deactivated / Suspended Users & Organizations directly from DB status
+    const suspendedUsersRes = await req.db.query('SELECT COUNT(*) FROM users WHERE is_suspended = TRUE OR is_deactivated = TRUE');
     const suspendedUsers = parseInt(suspendedUsersRes.rows[0].count, 10);
 
     const deletedUsersRes = await req.db.query('SELECT COUNT(*) FROM users WHERE is_deleted = TRUE');
     const deletedUsers = parseInt(deletedUsersRes.rows[0].count, 10);
 
-    const suspendedOrgsRes = await req.db.query('SELECT COUNT(*) FROM organizations WHERE is_deleted = TRUE');
+    const suspendedOrgsRes = await req.db.query('SELECT COUNT(*) FROM organizations WHERE is_suspended = TRUE OR is_deactivated = TRUE');
     const suspendedOrgs = parseInt(suspendedOrgsRes.rows[0].count, 10);
 
-    // 8. Total Thoughts
-    const totalThoughtsRes = await req.db.query('SELECT COUNT(*) FROM post_comments');
+    // 8. Total Thoughts directly from post_comments in DB
+    let totalThoughtsQuery = 'SELECT COUNT(*) FROM post_comments';
+    let totalThoughtsParams = [];
+    if (isCustom) {
+      totalThoughtsQuery += ' WHERE created_at >= $1 AND created_at <= $2';
+      totalThoughtsParams = [start.toISOString(), end.toISOString()];
+    }
+    const totalThoughtsRes = await req.db.query(totalThoughtsQuery, totalThoughtsParams);
     const totalThoughts = parseInt(totalThoughtsRes.rows[0].count, 10);
 
     const durationDays = intervalMs / (1000 * 60 * 60 * 24);
@@ -192,7 +211,13 @@ exports.getDashboardMetrics = async (req, res) => {
       chartData
     };
 
-    await redis.setex(cacheKey, 300, JSON.stringify(responseData)); // Cache for 5 minutes
+    try {
+      if (redis.status === 'ready') {
+        await redis.setex(cacheKey, 300, JSON.stringify(responseData)); // Cache for 5 minutes
+      }
+    } catch (cacheErr) {
+      // Ignore cache save failure
+    }
 
     res.json(responseData);
 
@@ -1342,7 +1367,14 @@ function formatTimeAgo(dateString) {
 exports.getOrganizationStats = async (req, res) => {
   try {
     const cacheKey = 'dashboard:organization_stats';
-    const cachedData = await redis.get(cacheKey);
+    let cachedData = null;
+    try {
+      if (redis.status === 'ready') {
+        cachedData = await redis.get(cacheKey);
+      }
+    } catch (cacheErr) {
+      // Ignore cache lookup failure
+    }
     if (cachedData) {
       return res.json(JSON.parse(cachedData));
     }
@@ -1364,46 +1396,45 @@ exports.getOrganizationStats = async (req, res) => {
       orgGrowth = 100;
     }
 
-    // 2. Pending Verification
-    const pendingVerificationRes = await req.db.query("SELECT COUNT(*) FROM organizations WHERE verification_status IN ('UNVERIFIED', 'DOMAIN_PENDING') AND is_deleted = false");
+    // 2. Pending Verification (all pending statuses)
+    const pendingVerificationRes = await req.db.query("SELECT COUNT(*) FROM organizations WHERE verification_status IN ('UNVERIFIED', 'DOMAIN_PENDING', 'DOCUMENT_PENDING') AND is_deleted = false");
     const pendingVerification = parseInt(pendingVerificationRes.rows[0].count, 10);
 
-    // 3. Incomplete Onboarding
-    const incompleteOnboardingRes = await req.db.query('SELECT COUNT(*) FROM organizations WHERE onboarding_stage = 2 AND is_deleted = false');
+    // 3. Incomplete Onboarding (cast properly to avoid varchar = integer operator error)
+    const incompleteOnboardingRes = await req.db.query("SELECT COUNT(*) FROM organizations WHERE (onboarding_completed = FALSE OR onboarding_stage != 'COMPLETED' OR onboarding_stage = '2') AND is_deleted = false");
     const incompleteOnboarding = parseInt(incompleteOnboardingRes.rows[0].count, 10);
 
     // 4. Avg. Verification Time
     const avgVerificationTimeRes = await req.db.query(`
         SELECT AVG(EXTRACT(EPOCH FROM (verified_at - created_at))) as avg_seconds
         FROM organizations
-        WHERE verification_status = 'DOMAIN_VERIFIED' AND verified_at IS NOT NULL
+        WHERE verified_at IS NOT NULL
     `);
 
     const avgVerificationTimeSeconds = parseFloat(avgVerificationTimeRes.rows[0].avg_seconds || 0);
-    const avgVerificationTimeDays = avgVerificationTimeSeconds > 0 ? (avgVerificationTimeSeconds / 86400).toFixed(1) : 0;
+    const avgVerificationTimeDays = avgVerificationTimeSeconds > 0 ? (avgVerificationTimeSeconds / 86400).toFixed(1) : '0';
 
     // Previous 7 days avg verification time
     const sevenDaysAgo = new Date(new Date().setDate(new Date().getDate() - 7)).toISOString();
     const prevAvgVerificationTimeRes = await req.db.query(`
         SELECT AVG(EXTRACT(EPOCH FROM (verified_at - created_at))) as avg_seconds
         FROM organizations
-        WHERE verification_status = 'DOMAIN_VERIFIED' AND verified_at IS NOT NULL AND verified_at <= $1
+        WHERE verified_at IS NOT NULL AND verified_at <= $1
     `, [sevenDaysAgo]);
 
     const prevAvgVerificationTimeSeconds = parseFloat(prevAvgVerificationTimeRes.rows[0].avg_seconds || avgVerificationTimeSeconds);
-    const prevAvgVerificationTimeDays = prevAvgVerificationTimeSeconds > 0 ? (prevAvgVerificationTimeSeconds / 86400).toFixed(1) : 0;
+    const prevAvgVerificationTimeDays = prevAvgVerificationTimeSeconds > 0 ? (prevAvgVerificationTimeSeconds / 86400).toFixed(1) : '0';
 
-    const avgVerificationTimeChange = (avgVerificationTimeDays - prevAvgVerificationTimeDays).toFixed(1);
+    const avgVerificationTimeChange = (parseFloat(avgVerificationTimeDays) - parseFloat(prevAvgVerificationTimeDays)).toFixed(1);
 
-    // 5. Active Organizations
+    // 5. Active Organizations (Genuine active status: non-deleted, non-suspended, non-deactivated)
     const activeOrgsRes = await req.db.query(
-      "SELECT COUNT(*) FROM organizations WHERE last_active_at >= $1 AND is_deleted = false AND is_suspended = false",
-      [thirtyDaysAgo]
+      "SELECT COUNT(*) FROM organizations WHERE (is_deleted IS FALSE OR is_deleted IS NULL) AND (is_suspended IS FALSE OR is_suspended IS NULL) AND (is_deactivated IS FALSE OR is_deactivated IS NULL)"
     );
     const activeOrganizations = parseInt(activeOrgsRes.rows[0].count, 10);
 
-    // 6. Suspended
-    const suspendedRes = await req.db.query('SELECT COUNT(*) FROM organizations WHERE is_suspended = TRUE AND is_deleted = false');
+    // 6. Suspended / Deactivated
+    const suspendedRes = await req.db.query('SELECT COUNT(*) FROM organizations WHERE (is_suspended = TRUE OR is_deactivated = TRUE) AND is_deleted = false');
     const suspended = parseInt(suspendedRes.rows[0].count, 10);
 
     const responseData = {
@@ -1417,7 +1448,13 @@ exports.getOrganizationStats = async (req, res) => {
       suspended
     };
 
-    await redis.setex(cacheKey, 300, JSON.stringify(responseData)); // Cache for 5 minutes
+    try {
+      if (redis.status === 'ready') {
+        await redis.setex(cacheKey, 300, JSON.stringify(responseData)); // Cache for 5 minutes
+      }
+    } catch (cacheErr) {
+      // Ignore cache save failure
+    }
 
     res.json(responseData);
 
