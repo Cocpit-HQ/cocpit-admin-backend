@@ -20,6 +20,22 @@ exports.getUserRoles = async (req, res) => {
   }
 };
 
+exports.getColleges = async (req, res) => {
+  try {
+    const query = `
+      SELECT DISTINCT TRIM(school_name) AS college
+      FROM educations
+      WHERE school_name IS NOT NULL AND TRIM(school_name) <> ''
+      ORDER BY college ASC
+    `;
+    const result = await req.db.query(query);
+    res.json(result.rows.map(row => row.college));
+  } catch (err) {
+    console.error('Error fetching colleges:', err);
+    res.status(500).json({ error: 'Server error fetching colleges' });
+  }
+};
+
 exports.getUsers = async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -29,6 +45,7 @@ exports.getUsers = async (req, res) => {
     const search = req.query.search || '';
     const status = req.query.status || 'All';
     const roleFilter = req.query.role || 'All';
+    const collegeFilter = req.query.college || 'All';
 
     let baseQuery = 'FROM users u LEFT JOIN profiles p ON u.user_id = p.user_id WHERE 1=1';
     let queryParams = [];
@@ -49,6 +66,17 @@ exports.getUsers = async (req, res) => {
       queryParams.push(roleFilter);
       const roleParamIndex = queryParams.length;
       baseQuery += ` AND COALESCE(p.account_type, u.user_type, 'Working Professional') = $${roleParamIndex}`;
+    }
+
+    // College / Institution Filter
+    if (collegeFilter && collegeFilter !== 'All') {
+      queryParams.push(collegeFilter);
+      const collegeParamIndex = queryParams.length;
+      baseQuery += ` AND EXISTS (
+        SELECT 1 FROM educations ed 
+        WHERE ed.profile_id = p.profile_id 
+          AND LOWER(TRIM(ed.school_name)) = LOWER(TRIM($${collegeParamIndex}))
+      )`;
     }
 
     // Search Filter
@@ -104,7 +132,8 @@ exports.getUsers = async (req, res) => {
         u.is_suspended,
         u.is_deleted,
         u.avatar_url,
-        u.created_at
+        u.created_at,
+        (SELECT ed.school_name FROM educations ed WHERE ed.profile_id = p.profile_id ORDER BY ed.start_date DESC NULLS LAST LIMIT 1) AS college
       ${baseQuery}
       ORDER BY u.created_at DESC
       LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}
@@ -142,6 +171,7 @@ exports.getUsers = async (req, res) => {
         name: user.full_name,
         email: user.email,
         role: role,
+        college: user.college || null,
         status: userStatus,
         avatar: user.avatar_url,
         joined: user.created_at
@@ -168,7 +198,7 @@ exports.getUserDetails = async (req, res) => {
 
     // 1. Basic User Info
     const userQuery = `
-      SELECT user_id, full_name, email, mobile_number, 
+      SELECT user_id, full_name, email, mobile_number, headline, about_text,
              location_formatted, location_city, location_state, location_country, location,
              location_lat, location_lng,
              avatar_url, created_at, user_type, is_suspended, is_deleted, last_active_at, moderation_flags,
@@ -199,21 +229,21 @@ exports.getUserDetails = async (req, res) => {
              j.title AS job_title, j.job_id, c.post_content, c.post_media, c.target_user_name, c.target_user_avatar, c.post_created_at
       FROM (
         SELECT ual.id::text as id, ual.action_type, ual.entity_type, ual.created_at, ual.entity_id, ual.metadata, 
-               p.content as post_content, 
-               (SELECT json_agg(json_build_object('url', url, 'media_type', media_type)) FROM post_media WHERE post_id = p.post_id) as post_media,
-               u.full_name as target_user_name,
-               u.avatar_url as target_user_avatar,
-               p.created_at as post_created_at
+                p.content as post_content, 
+                (SELECT json_agg(json_build_object('url', url, 'media_type', media_type)) FROM post_media WHERE post_id = p.post_id) as post_media,
+                u.full_name as target_user_name,
+                u.avatar_url as target_user_avatar,
+                p.created_at as post_created_at
         FROM user_activity_log ual
         LEFT JOIN posts p ON ual.entity_type = 'post' AND ual.entity_id::text = p.post_id::text
         LEFT JOIN users u ON p.author_id = u.user_id
         WHERE ual.user_id = $1
         UNION ALL
         SELECT post_id::text as id, 'POST_CREATED' as action_type, 'post' as entity_type, created_at, NULL as entity_id, '{}'::jsonb as metadata,
-               content as post_content, (SELECT json_agg(json_build_object('url', url, 'media_type', media_type)) FROM post_media WHERE post_id = posts.post_id) as post_media,
-               (SELECT full_name FROM users WHERE user_id = posts.author_id) as target_user_name,
-               (SELECT avatar_url FROM users WHERE user_id = posts.author_id) as target_user_avatar,
-               created_at as post_created_at
+                content as post_content, (SELECT json_agg(json_build_object('url', url, 'media_type', media_type)) FROM post_media WHERE post_id = posts.post_id) as post_media,
+                (SELECT full_name FROM users WHERE user_id = posts.author_id) as target_user_name,
+                (SELECT avatar_url FROM users WHERE user_id = posts.author_id) as target_user_avatar,
+                created_at as post_created_at
         FROM posts 
         WHERE author_id = $1
       ) c
@@ -238,11 +268,80 @@ exports.getUserDetails = async (req, res) => {
     `;
     const warningsResult = await req.db.query(warningsQuery, [id]);
 
+    // 6. Complete Profile Details (Education, Experience, Skills, Projects, Bio)
+    let detailedProfile = {};
+    try {
+      const profileDetailsQuery = `
+        SELECT 
+          p.profile_id,
+          p.account_type,
+          p.working_industry,
+          p.open_to,
+          p.availability,
+          p.work_preference,
+          COALESCE(
+            (SELECT json_agg(json_build_object(
+              'school_name', ed.school_name,
+              'degree', ed.degree,
+              'field_of_study', ed.field_of_study,
+              'location', ed.location,
+              'start_date', ed.start_date,
+              'end_date', ed.end_date,
+              'description', ed.description
+            ) ORDER BY ed.start_date DESC NULLS LAST)
+             FROM educations ed WHERE ed.profile_id = p.profile_id),
+            '[]'::json
+          ) AS educations,
+          COALESCE(
+            (SELECT json_agg(json_build_object(
+              'title', e.title,
+              'company_name', e.company_name,
+              'location', e.location,
+              'work_type', e.work_type,
+              'work_mode', e.work_mode,
+              'start_date', e.start_date,
+              'end_date', e.end_date,
+              'is_current', e.is_current,
+              'description', e.description
+            ) ORDER BY e.is_current DESC, e.start_date DESC NULLS LAST)
+             FROM experiences e WHERE e.profile_id = p.profile_id),
+            '[]'::json
+          ) AS experiences,
+          COALESCE(
+            (SELECT json_agg(s.name)
+             FROM user_skills us JOIN skills s ON us.skill_id = s.skill_id
+             WHERE us.profile_id = p.profile_id),
+            '[]'::json
+          ) AS skills,
+          COALESCE(
+            (SELECT json_agg(json_build_object(
+              'title', pr.title,
+              'role', pr.role,
+              'organization', pr.organization,
+              'details', pr.details,
+              'start_year', pr.start_year,
+              'end_year', pr.end_year
+            ) ORDER BY pr.created_at DESC NULLS LAST)
+             FROM projects pr WHERE pr.profile_id = p.profile_id),
+            '[]'::json
+          ) AS projects
+        FROM profiles p
+        WHERE p.user_id = $1
+        LIMIT 1
+      `;
+      const profileDetailsResult = await req.db.query(profileDetailsQuery, [id]);
+      if (profileDetailsResult.rows.length > 0) {
+        detailedProfile = profileDetailsResult.rows[0];
+      }
+    } catch (profileErr) {
+      console.error('Warning: could not fetch extended profile details:', profileErr.message);
+    }
+
     // Formatting status and role
     let status = 'Active';
     if (user.is_deleted) status = 'Deleted';
     else if (user.is_suspended) status = 'Suspended';
-    const role = user.user_type || 'Working Professional';
+    const role = detailedProfile.account_type || user.user_type || 'Working Professional';
 
     // Location Formatting
     let formattedLocation = user.location_formatted || user.location;
@@ -275,7 +374,20 @@ exports.getUserDetails = async (req, res) => {
       activities: activityResult.rows,
       actionHistory: warningsResult.rows,
       socialAccounts: socialResult.rows.map(r => r.provider),
-      suspensionCount: parseInt(user.suspension_count || 0)
+      suspensionCount: parseInt(user.suspension_count || 0),
+      detailedProfile: {
+        headline: user.headline || '',
+        about: user.about_text || '',
+        industry: detailedProfile.working_industry || '',
+        openTo: detailedProfile.open_to || '',
+        availability: detailedProfile.availability || '',
+        workPreference: detailedProfile.work_preference || '',
+        resumeUrl: null,
+        educations: detailedProfile.educations || [],
+        experiences: detailedProfile.experiences || [],
+        skills: detailedProfile.skills || [],
+        projects: detailedProfile.projects || []
+      }
     };
 
     res.json(profileData);

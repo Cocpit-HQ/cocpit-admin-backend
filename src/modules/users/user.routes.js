@@ -5,6 +5,7 @@ const userController = require('./user.controller');
 const reportController = require('../reports/report.controller');
 
 router.get('/roles', requireRoles(['Admin', 'Developer']), userController.getUserRoles);
+router.get('/colleges', requireRoles(['Admin', 'Developer', 'Moderator']), userController.getColleges);
 router.get('/export-marketing-report', requireRoles(['Admin', 'Developer', 'Moderator']), reportController.exportMarketingProfilesReport);
 router.get('/', requireRoles(['Admin', 'Developer']), userController.getUsers);
 router.get('/:id', requireRoles(['Admin', 'Developer', 'Moderator']), userController.getUserDetails);

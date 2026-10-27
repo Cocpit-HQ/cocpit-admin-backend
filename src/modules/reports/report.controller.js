@@ -68,9 +68,9 @@ exports.getReports = async (req, res) => {
         '100%' as "repScore", -- Mock rep score for now
         target_user_id as "targetUserId",
         target_user_name as "targetUserName",
-        (SELECT url FROM post_media pm WHERE pm.post_id = target_id LIMIT 1) AS "postImageUrl",
-        (SELECT media_type FROM post_media pm WHERE pm.post_id = target_id LIMIT 1) AS "postMediaType",
-        (SELECT json_agg(po.option_text) FROM post_polls pp JOIN poll_options po ON pp.poll_id = po.poll_id WHERE pp.post_id = target_id) AS "pollOptions"
+        (SELECT url FROM post_media pm WHERE pm.post_id::text = target_id::text LIMIT 1) AS "postImageUrl",
+        (SELECT media_type FROM post_media pm WHERE pm.post_id::text = target_id::text LIMIT 1) AS "postMediaType",
+        (SELECT json_agg(po.option_text) FROM post_polls pp JOIN poll_options po ON pp.poll_id = po.poll_id WHERE pp.post_id::text = target_id::text) AS "pollOptions"
       FROM admin_reports_view
       ${whereClause}
       ORDER BY created_at DESC
@@ -291,7 +291,7 @@ exports.deleteReportedComment = async (req, res) => {
 
 exports.exportMarketingProfilesReport = async (req, res) => {
   try {
-    const { format = 'csv', status = 'All', role = 'All', search = '', startDate, endDate } = req.query;
+    const { format = 'csv', status = 'All', role = 'All', college = 'All', search = '', startDate, endDate } = req.query;
 
     let whereConditions = [];
     let queryParams = [];
@@ -313,11 +313,21 @@ exports.exportMarketingProfilesReport = async (req, res) => {
       whereConditions.push(`COALESCE(p.account_type, u.user_type, 'Working Professional') = $${queryParams.length}`);
     }
 
+    // Filter by College / Institution
+    if (college && college !== 'All') {
+      queryParams.push(college);
+      whereConditions.push(`EXISTS (
+        SELECT 1 FROM educations ed 
+        WHERE ed.profile_id = p.profile_id 
+          AND LOWER(TRIM(ed.school_name)) = LOWER(TRIM($${queryParams.length}))
+      )`);
+    }
+
     // Search Filter
     if (search) {
       queryParams.push(`%${search}%`);
       const searchIdx = queryParams.length;
-      whereConditions.push(`(u.email ILIKE $${searchIdx} OR u.full_name ILIKE $${searchIdx} OR u.location ILIKE $${searchIdx} OR u.headline ILIKE $${searchIdx} OR u.company_name ILIKE $${searchIdx} OR u.school ILIKE $${searchIdx})`);
+      whereConditions.push(`(u.email ILIKE $${searchIdx} OR u.full_name ILIKE $${searchIdx} OR u.location ILIKE $${searchIdx} OR u.headline ILIKE $${searchIdx})`);
     }
 
     // Date Range Filter
@@ -339,10 +349,10 @@ exports.exportMarketingProfilesReport = async (req, res) => {
         u.email,
         u.mobile_number,
         u.headline,
-        u.job_title,
-        u.company_name,
-        u.school,
-        u.degree,
+        (SELECT e.title FROM experiences e WHERE e.profile_id = p.profile_id ORDER BY e.is_current DESC, e.start_date DESC NULLS LAST LIMIT 1) AS job_title,
+        (SELECT e.company_name FROM experiences e WHERE e.profile_id = p.profile_id ORDER BY e.is_current DESC, e.start_date DESC NULLS LAST LIMIT 1) AS company_name,
+        (SELECT ed.school_name FROM educations ed WHERE ed.profile_id = p.profile_id ORDER BY ed.start_date DESC NULLS LAST LIMIT 1) AS school,
+        (SELECT ed.degree FROM educations ed WHERE ed.profile_id = p.profile_id ORDER BY ed.start_date DESC NULLS LAST LIMIT 1) AS degree,
         COALESCE(u.location_formatted, u.location, CONCAT_WS(', ', u.location_city, u.location_state, u.location_country)) AS location,
         u.about_text,
         u.created_at AS joined_at,
@@ -463,7 +473,12 @@ exports.exportMarketingProfilesReport = async (req, res) => {
     }
 
     if (format === 'pdf') {
-      const puppeteer = require('puppeteer');
+      let puppeteer;
+      try {
+        puppeteer = require('puppeteer');
+      } catch (pErr) {
+        puppeteer = null;
+      }
       const userCardsHtml = users.map((u) => {
         let statusClass = 'status-active';
         let statusText = 'Active';
@@ -632,6 +647,13 @@ exports.exportMarketingProfilesReport = async (req, res) => {
         </body>
         </html>
       `;
+
+      if (!puppeteer) {
+        // Puppeteer is not installed in the environment; return printable HTML with automatic print trigger
+        const printableHtml = htmlContent.replace('</body>', '<script>window.onload = () => { window.print(); };</script></body>');
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        return res.send(printableHtml);
+      }
 
       const browser = await puppeteer.launch({
         headless: 'new',
