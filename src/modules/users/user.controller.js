@@ -46,6 +46,7 @@ exports.getUsers = async (req, res) => {
     const status = req.query.status || 'All';
     const roleFilter = req.query.role || 'All';
     const collegeFilter = req.query.college || 'All';
+    const onboardingFilter = req.query.onboarding || 'All';
 
     let baseQuery = 'FROM users u LEFT JOIN profiles p ON u.user_id = p.user_id WHERE 1=1';
     let queryParams = [];
@@ -58,6 +59,15 @@ exports.getUsers = async (req, res) => {
         baseQuery += ' AND u.is_suspended = true';
       } else if (status === 'Deleted') {
         baseQuery += ' AND u.is_deleted = true';
+      }
+    }
+
+    // Onboarding Filter
+    if (onboardingFilter !== 'All') {
+      if (onboardingFilter.toLowerCase() === 'completed') {
+        baseQuery += ' AND u.is_onboarding_complete = true';
+      } else if (onboardingFilter.toLowerCase() === 'incomplete') {
+        baseQuery += ' AND (u.is_onboarding_complete = false OR u.is_onboarding_complete IS NULL)';
       }
     }
 
@@ -111,7 +121,8 @@ exports.getUsers = async (req, res) => {
       SELECT 
         COUNT(*) as total_users,
         COUNT(*) FILTER (WHERE is_suspended = false AND is_deleted = false) as active_users,
-        COUNT(*) FILTER (WHERE is_suspended = true) as suspended_users
+        COUNT(*) FILTER (WHERE is_suspended = true) as suspended_users,
+        COUNT(*) FILTER (WHERE is_onboarding_complete = true) as onboarding_complete
       FROM users
     `;
     const statsResult = await req.db.query(statsQuery);
@@ -119,6 +130,7 @@ exports.getUsers = async (req, res) => {
       totalUsers: parseInt(statsResult.rows[0].total_users),
       activeUsers: parseInt(statsResult.rows[0].active_users),
       suspendedUsers: parseInt(statsResult.rows[0].suspended_users),
+      onboardingComplete: parseInt(statsResult.rows[0].onboarding_complete) || 0,
     };
 
     // Get Paginated Data
@@ -131,6 +143,8 @@ exports.getUsers = async (req, res) => {
         p.account_type,
         u.is_suspended,
         u.is_deleted,
+        u.is_onboarding_complete,
+        u.onboarding_step,
         u.avatar_url,
         u.created_at,
         (SELECT ed.school_name FROM educations ed WHERE ed.profile_id = p.profile_id ORDER BY ed.start_date DESC NULLS LAST LIMIT 1) AS college
@@ -168,11 +182,13 @@ exports.getUsers = async (req, res) => {
       return {
         id: user.user_id,
         initials,
-        name: user.full_name,
+        name: user.full_name || 'Incomplete Profile',
         email: user.email,
         role: role,
         college: user.college || null,
         status: userStatus,
+        isOnboardingComplete: Boolean(user.is_onboarding_complete),
+        onboardingStep: user.onboarding_step,
         avatar: user.avatar_url,
         joined: user.created_at
       };
@@ -202,7 +218,7 @@ exports.getUserDetails = async (req, res) => {
              location_formatted, location_city, location_state, location_country, location,
              location_lat, location_lng,
              avatar_url, created_at, user_type, is_suspended, is_deleted, last_active_at, moderation_flags,
-             suspension_count
+             suspension_count, is_onboarding_complete, onboarding_step
       FROM users WHERE user_id = $1
     `;
     const userResult = await req.db.query(userQuery, [id]);
@@ -363,6 +379,8 @@ exports.getUserDetails = async (req, res) => {
       lastActive: user.last_active_at,
       status: status,
       role: role,
+      isOnboardingComplete: Boolean(user.is_onboarding_complete),
+      onboardingStep: user.onboarding_step,
       stats: {
         posts: parseInt(stats.posts_count),
         followers: parseInt(stats.followers_count),
@@ -400,7 +418,7 @@ exports.getUserDetails = async (req, res) => {
 exports.warnUser = async (req, res) => {
   try {
     const { id } = req.params;
-    const { reason, message, isSevere } = req.body;
+    const { reason, message, isSevere, reportIds, postId, postTitle } = req.body;
 
     if (!reason || !reason.trim()) {
       return res.status(400).json({ error: 'Warning reason is required.' });
@@ -420,8 +438,41 @@ exports.warnUser = async (req, res) => {
 
     await req.db.query(
       'INSERT INTO moderation_actions (target_type, target_id, action_type, reason, duration_days, performed_by) VALUES ($1, $2, $3, $4, $5, $6)',
-      ['USER', id, 'WARNING', `${reason}. ${message}`, null, req.user.userId]
+      ['USER', id, 'WARNING', `${reason}. ${message || ''}`, null, req.user.userId]
     );
+
+    // Insert into account_actions so it appears in in-app "Account actions" tab
+    await req.db.query(
+      `INSERT INTO account_actions (
+        user_id, action_type, custom_reason, moderator_note,
+        affected_type, affected_id, affected_title, status, issued_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        id,
+        'warning',
+        reason,
+        message || 'Your account received an official warning for violating community guidelines.',
+        postId ? 'POST' : 'USER',
+        postId || id,
+        postTitle || (postId ? 'Reported Content' : 'Account'),
+        'active',
+        req.user.userId
+      ]
+    );
+
+    // If report IDs are passed, resolve them and notify reporters
+    if (Array.isArray(reportIds) && reportIds.length > 0) {
+      await req.db.query(
+        "UPDATE reports SET status = 'action_taken', resolved_at = NOW() WHERE id = ANY($1)",
+        [reportIds]
+      );
+      for (const rId of reportIds) {
+        await req.db.query(
+          'INSERT INTO report_review_notes (report_id, message, is_system, created_by) VALUES ($1, $2, false, $3)',
+          [rId, 'Our moderation team reviewed your report and took action: a formal warning was issued to the user.', req.user.userId]
+        );
+      }
+    }
 
     // Increment moderation flags
     const updateQuery = `
@@ -456,7 +507,27 @@ exports.warnUser = async (req, res) => {
 
       await req.db.query(
         'INSERT INTO moderation_actions (target_type, target_id, action_type, reason, duration_days, performed_by) VALUES ($1, $2, $3, $4, $5, $6)',
-        ['USER', id, 'SUSPENSION', `Auto-suspension for exceeding 7 moderation flags. Your account has been automatically suspended due to repeated violations.`, 7, adminId]
+        ['USER', id, 'SUSPENSION', 'Auto-suspension for exceeding 7 moderation flags. Your account has been automatically suspended due to repeated violations.', 7, adminId]
+      );
+
+      await req.db.query(
+        `INSERT INTO account_actions (
+          user_id, action_type, custom_reason, moderator_note,
+          affected_type, affected_id, affected_title, duration_days, expires_at, status, issued_by
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          id,
+          'suspension',
+          'Account Suspended',
+          'Your account has been automatically suspended for 7 days due to repeated community guidelines violations.',
+          'USER',
+          id,
+          'Account',
+          7,
+          new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+          'active',
+          adminId
+        ]
       );
 
       // Notify Main API to kill active sessions and blacklist token
@@ -508,7 +579,7 @@ exports.warnUser = async (req, res) => {
 exports.suspendUser = async (req, res) => {
   try {
     const { id } = req.params;
-    const { duration } = req.body;
+    const { duration, reportIds } = req.body;
 
     let suspendedUntil = null;
     if (duration === 'Short Temporary (3-7 days)') {
@@ -545,6 +616,41 @@ exports.suspendUser = async (req, res) => {
       'INSERT INTO moderation_actions (target_type, target_id, action_type, reason, duration_days, performed_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING action_id',
       ['USER', id, 'SUSPENSION', `Manual suspension by admin. Your account has been suspended. Duration: ${suspensionDuration}.`, durationDays, adminId]
     );
+
+    // Insert into account_actions table
+    await req.db.query(
+      `INSERT INTO account_actions (
+        user_id, action_type, custom_reason, moderator_note,
+        affected_type, affected_id, affected_title, duration_days, expires_at, status, issued_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      [
+        id,
+        'suspension',
+        'Account Suspended',
+        `Your account has been suspended by an administrator for ${suspensionDuration}.`,
+        'USER',
+        id,
+        'Account',
+        durationDays,
+        suspendedUntil,
+        'active',
+        adminId
+      ]
+    );
+
+    // If associated reports exist, mark them resolved
+    if (Array.isArray(reportIds) && reportIds.length > 0) {
+      await req.db.query(
+        "UPDATE reports SET status = 'action_taken', resolved_at = NOW() WHERE id = ANY($1)",
+        [reportIds]
+      );
+      for (const rId of reportIds) {
+        await req.db.query(
+          'INSERT INTO report_review_notes (report_id, message, is_system, created_by) VALUES ($1, $2, false, $3)',
+          [rId, 'Our moderation team reviewed your report and took action: the reported user account has been suspended.', adminId]
+        );
+      }
+    }
 
     const actionId = actionRes.rows[0].action_id;
     const appealToken = crypto.randomBytes(32).toString('hex');
@@ -1023,4 +1129,6 @@ exports.getUserThoughts = async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch user thoughts' });
   }
 };
+
+
 
