@@ -19,62 +19,123 @@ exports.getReports = async (req, res) => {
     let queryParams = [];
 
     if (status && status !== 'all') {
-      queryParams.push(status);
-      whereConditions.push(`status = $${queryParams.length}`);
+      if (status === 'active') {
+        whereConditions.push("r.status IN ('active', 'pending')");
+      } else if (status === 'escalated') {
+        whereConditions.push("r.status = 'escalated'");
+      } else if (status === 'resolved') {
+        whereConditions.push("r.status IN ('resolved', 'action_taken')");
+      } else if (status === 'dismissed') {
+        whereConditions.push("r.status IN ('dismissed', 'no_action')");
+      } else if (status === 'all_resolved' || status === 'resolved,dismissed') {
+        whereConditions.push("r.status IN ('resolved', 'action_taken', 'dismissed', 'no_action')");
+      } else {
+        queryParams.push(status);
+        whereConditions.push(`r.status = ${queryParams.length}`);
+      }
     }
 
     if (type && type !== 'All') {
       queryParams.push(type);
-      whereConditions.push(`target_type = $${queryParams.length}`);
+      whereConditions.push(`r.target_type = ${queryParams.length}`);
     }
     if (reason && reason !== 'All') {
       queryParams.push(reason);
-      whereConditions.push(`reason = $${queryParams.length}`);
+      whereConditions.push(`(r.reason = ${queryParams.length} OR rr.label = ${queryParams.length} OR r.custom_reason = ${queryParams.length})`);
     }
     if (severity && severity !== 'All') {
       queryParams.push(severity);
-      whereConditions.push(`severity = $${queryParams.length}`);
+      whereConditions.push(`r.severity = ${queryParams.length}`);
     }
     if (targetUserId) {
       queryParams.push(targetUserId);
-      whereConditions.push(`target_user_id = $${queryParams.length}`);
+      whereConditions.push(`(
+        (r.target_type = 'USER' AND r.target_id::text = ${queryParams.length}::text) OR
+        (r.target_type IN ('Content', 'POST') AND p.author_id::text = ${queryParams.length}::text) OR
+        (r.target_type IN ('COMMENT', 'THOUGHT') AND pc.author_id::text = ${queryParams.length}::text)
+      )`);
     }
     if (reporterId) {
       queryParams.push(reporterId);
-      whereConditions.push(`reporter_id = $${queryParams.length}`);
+      whereConditions.push(`r.reporter_id::text = ${queryParams.length}::text`);
     }
 
-    let whereClause = whereConditions.length > 0 ? `WHERE ` + whereConditions.join(' AND ') : '';
+    let whereClause = whereConditions.length > 0 ? 'WHERE ' + whereConditions.join(' AND ') : '';
+
+    const baseJoin = `
+      FROM reports r
+      LEFT JOIN report_reasons rr ON r.reason_id = rr.id
+      LEFT JOIN users u ON r.reporter_id = u.user_id
+      LEFT JOIN users target_u ON (r.target_type = 'USER' AND r.target_id = target_u.user_id)
+      LEFT JOIN posts p ON (r.target_type IN ('Content', 'POST') AND r.target_id = p.post_id)
+      LEFT JOIN users pu ON p.author_id = pu.user_id
+      LEFT JOIN organizations po ON p.author_org_id = po.org_id
+      LEFT JOIN post_comments pc ON (r.target_type IN ('COMMENT', 'THOUGHT') AND r.target_id = pc.comment_id)
+      LEFT JOIN users cu ON pc.author_id = cu.user_id
+    `;
 
     // Get total count for pagination
-    const countQuery = `SELECT COUNT(*) FROM admin_reports_view ${whereClause}`;
+    const countQuery = `SELECT COUNT(*) ${baseJoin} ${whereClause}`;
     const countResult = await req.db.query(countQuery, queryParams);
     const total = parseInt(countResult.rows[0].count, 10);
 
     const query = `
       SELECT 
-        id,
-        target_type as type,
-        raw_target_type as "rawType",
-        severity,
-        offenses,
-        content_preview as "contentPreview",
-        image_url as "image",
-        created_at as "postTime",
-        target_id as "postId",
-        reason,
-        reported_by as "reportedBy",
-        reporter_id as "reporterId",
-        '100%' as "repScore", -- Mock rep score for now
-        target_user_id as "targetUserId",
-        target_user_name as "targetUserName",
-        (SELECT url FROM post_media pm WHERE pm.post_id::text = target_id::text LIMIT 1) AS "postImageUrl",
-        (SELECT media_type FROM post_media pm WHERE pm.post_id::text = target_id::text LIMIT 1) AS "postMediaType",
-        (SELECT json_agg(po.option_text) FROM post_polls pp JOIN poll_options po ON pp.poll_id = po.poll_id WHERE pp.post_id::text = target_id::text) AS "pollOptions"
-      FROM admin_reports_view
+        r.id,
+        r.target_type as type,
+        r.target_type as "rawType",
+        COALESCE(r.severity, 'Tier 1 (Minor)') as severity,
+        COALESCE(r.offenses, 1) as offenses,
+        COALESCE(r.content_preview, p.content, pc.content, 'Content reported') as "contentPreview",
+        (SELECT url FROM post_media pm WHERE pm.post_id::text = r.target_id::text LIMIT 1) as "image",
+        r.created_at as "postTime",
+        r.resolved_at as "resolvedAt",
+        r.target_id as "postId",
+        COALESCE(rr.label, r.reason, r.custom_reason, 'Policy violation') as reason,
+        r.status,
+        COALESCE(u.account_name, u.full_name, 'Anonymous') as "reportedBy",
+        r.reporter_id as "reporterId",
+        '100%' as "repScore",
+        CASE 
+          WHEN r.target_type = 'USER' THEN target_u.user_id
+          WHEN r.target_type IN ('Content', 'POST') THEN p.author_id
+          WHEN r.target_type IN ('COMMENT', 'THOUGHT') THEN pc.author_id
+          ELSE NULL
+        END as "targetUserId",
+        CASE 
+          WHEN r.target_type = 'USER' THEN COALESCE(target_u.account_name, target_u.full_name)
+          WHEN r.target_type IN ('Content', 'POST') THEN COALESCE(pu.account_name, pu.full_name, po.name)
+          WHEN r.target_type IN ('COMMENT', 'THOUGHT') THEN COALESCE(cu.account_name, cu.full_name)
+          ELSE 'Unknown'
+        END as "targetUserName",
+        (SELECT url FROM post_media pm WHERE pm.post_id::text = r.target_id::text LIMIT 1) AS "postImageUrl",
+        (SELECT media_type FROM post_media pm WHERE pm.post_id::text = r.target_id::text LIMIT 1) AS "postMediaType",
+        (SELECT json_agg(po2.option_text) FROM post_polls pp JOIN poll_options po2 ON pp.poll_id = po2.poll_id WHERE pp.post_id::text = r.target_id::text) AS "pollOptions",
+        (SELECT json_agg(json_build_object('id', rn.id, 'message', rn.message, 'createdAt', rn.created_at)) FROM report_review_notes rn WHERE rn.report_id = r.id) AS "reviewNotes",
+        (
+          SELECT json_build_object(
+            'actionType', aa.action_type,
+            'customReason', aa.custom_reason,
+            'moderatorNote', aa.moderator_note,
+            'createdAt', aa.created_at,
+            'durationDays', aa.duration_days
+          )
+          FROM account_actions aa
+          WHERE (aa.affected_id::text = r.target_id::text OR aa.user_id = (
+            CASE 
+              WHEN r.target_type = 'USER' THEN target_u.user_id
+              WHEN r.target_type IN ('Content', 'POST') THEN p.author_id
+              WHEN r.target_type IN ('COMMENT', 'THOUGHT') THEN pc.author_id
+              ELSE NULL
+            END
+          ))
+          ORDER BY aa.created_at DESC
+          LIMIT 1
+        ) AS "accountAction"
+      ${baseJoin}
       ${whereClause}
-      ORDER BY created_at DESC
-      LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}
+      ORDER BY r.created_at DESC
+      LIMIT ${queryParams.length + 1} OFFSET ${queryParams.length + 2}
     `;
 
     const result = await req.db.query(query, [...queryParams, limit, offset]);
@@ -94,17 +155,37 @@ exports.getReports = async (req, res) => {
 exports.updateReport = async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body; // 'escalated', 'resolved', 'dismissed'
+    const { status, note } = req.body; // 'escalated', 'resolved', 'dismissed', 'action_taken'
 
     if (!status) return res.status(400).json({ error: 'Status is required' });
 
+    let finalStatus = status;
+    if (status === 'resolved') finalStatus = 'action_taken';
+
     const result = await req.db.query(
       'UPDATE reports SET status = $1, resolved_at = NOW() WHERE id = $2 RETURNING *',
-      [status, id]
+      [finalStatus, id]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Report not found' });
+    }
+
+    const adminId = req.user?.userId || null;
+    let noteMessage = note;
+    if (!noteMessage) {
+      if (finalStatus === 'dismissed' || finalStatus === 'no_action') {
+        noteMessage = 'Our moderation team reviewed your report and found that the content does not violate our community standards. No action was taken.';
+      } else if (finalStatus === 'action_taken') {
+        noteMessage = 'Our moderation team reviewed your report and took action regarding the reported content.';
+      }
+    }
+
+    if (noteMessage && (finalStatus === 'dismissed' || finalStatus === 'action_taken' || finalStatus === 'no_action')) {
+      await req.db.query(
+        'INSERT INTO report_review_notes (report_id, message, is_system, created_by) VALUES ($1, $2, false, $3)',
+        [id, noteMessage, adminId]
+      );
     }
 
     res.json(result.rows[0]);
@@ -241,7 +322,7 @@ exports.deleteReportedPost = async (req, res) => {
 
     // Soft delete the post
     const updateRes = await req.db.query(
-      'UPDATE posts SET is_deleted = true WHERE post_id = $1 RETURNING *',
+      'UPDATE posts SET is_deleted = true WHERE post_id = $1 RETURNING author_id, content',
       [id]
     );
 
@@ -249,11 +330,42 @@ exports.deleteReportedPost = async (req, res) => {
       return res.status(404).json({ error: 'Post not found' });
     }
 
+    const authorId = updateRes.rows[0]?.author_id;
+    const postContent = updateRes.rows[0]?.content;
+    const adminId = req.user?.userId || null;
+
+    if (authorId) {
+      await req.db.query(
+        `INSERT INTO account_actions (
+          user_id, action_type, custom_reason, moderator_note,
+          affected_type, affected_id, affected_title, status, issued_by
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          authorId,
+          'post_removed',
+          'Community Guidelines Violation',
+          'Your post was removed for violating community guidelines.',
+          'POST',
+          id,
+          postContent ? (postContent.length > 80 ? postContent.slice(0, 80) + '...' : postContent) : 'Content',
+          'active',
+          adminId
+        ]
+      );
+    }
+
     // Automatically resolve all active/escalated reports targeting this post
-    await req.db.query(
-      "UPDATE reports SET status = 'resolved', resolved_at = NOW() WHERE target_type IN ('Content', 'POST', 'COMMENT') AND target_id = $1 AND status IN ('active', 'escalated')",
+    const reportRes = await req.db.query(
+      "UPDATE reports SET status = 'action_taken', resolved_at = NOW() WHERE target_type IN ('Content', 'POST') AND target_id::text = $1::text AND status IN ('active', 'pending', 'escalated') RETURNING id",
       [id]
     );
+
+    for (const r of reportRes.rows) {
+      await req.db.query(
+        'INSERT INTO report_review_notes (report_id, message, is_system, created_by) VALUES ($1, $2, false, $3)',
+        [r.id, 'Our moderation team reviewed your report and removed the reported content for violating community guidelines.', adminId]
+      );
+    }
 
     res.json({ message: 'Post deleted successfully and associated reports resolved.' });
   } catch (err) {
@@ -268,7 +380,7 @@ exports.deleteReportedComment = async (req, res) => {
 
     // Soft delete the comment
     const updateRes = await req.db.query(
-      'UPDATE post_comments SET is_deleted = true WHERE comment_id = $1 RETURNING *',
+      'UPDATE post_comments SET is_deleted = true WHERE comment_id = $1 RETURNING author_id, content',
       [id]
     );
 
@@ -276,11 +388,42 @@ exports.deleteReportedComment = async (req, res) => {
       return res.status(404).json({ error: 'Comment not found' });
     }
 
+    const authorId = updateRes.rows[0]?.author_id;
+    const commentContent = updateRes.rows[0]?.content;
+    const adminId = req.user?.userId || null;
+
+    if (authorId) {
+      await req.db.query(
+        `INSERT INTO account_actions (
+          user_id, action_type, custom_reason, moderator_note,
+          affected_type, affected_id, affected_title, status, issued_by
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          authorId,
+          'comment_removed',
+          'Community Guidelines Violation',
+          'Your comment was removed for violating community guidelines.',
+          'COMMENT',
+          id,
+          commentContent ? (commentContent.length > 80 ? commentContent.slice(0, 80) + '...' : commentContent) : 'Comment',
+          'active',
+          adminId
+        ]
+      );
+    }
+
     // Automatically resolve all active/escalated reports targeting this comment
-    await req.db.query(
-      "UPDATE reports SET status = 'resolved', resolved_at = NOW() WHERE target_type IN ('Content', 'POST', 'COMMENT') AND target_id = $1 AND status IN ('active', 'escalated')",
+    const reportRes = await req.db.query(
+      "UPDATE reports SET status = 'action_taken', resolved_at = NOW() WHERE target_type IN ('COMMENT', 'THOUGHT') AND target_id::text = $1::text AND status IN ('active', 'pending', 'escalated') RETURNING id",
       [id]
     );
+
+    for (const r of reportRes.rows) {
+      await req.db.query(
+        'INSERT INTO report_review_notes (report_id, message, is_system, created_by) VALUES ($1, $2, false, $3)',
+        [r.id, 'Our moderation team reviewed your report and removed the reported comment for violating community guidelines.', adminId]
+      );
+    }
 
     res.json({ message: 'Comment deleted successfully and associated reports resolved.' });
   } catch (err) {
