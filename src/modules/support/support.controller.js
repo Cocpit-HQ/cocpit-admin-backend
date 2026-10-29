@@ -5,14 +5,15 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 
 exports.getTickets = async (req, res) => {
     try {
+        const db = req.db || pool;
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 20;
         const offset = (page - 1) * limit;
 
-        const countRes = await pool.query("SELECT COUNT(*) FROM support_tickets");
+        const countRes = await db.query("SELECT COUNT(*) FROM support_tickets");
         const total = parseInt(countRes.rows[0].count);
 
-        const result = await pool.query(
+        const result = await db.query(
             `SELECT ticket_id as id, email, description as issue, attachment_url as attachment, status, created_at as date
              FROM support_tickets
              ORDER BY created_at DESC
@@ -38,9 +39,10 @@ exports.getTickets = async (req, res) => {
 
 exports.getTicketDetails = async (req, res) => {
     try {
+        const db = req.db || pool;
         const { id } = req.params;
 
-        const ticketRes = await pool.query(
+        const ticketRes = await db.query(
             `SELECT ticket_id as id, email, description as issue, attachment_url as attachment, status, created_at as date
              FROM support_tickets
              WHERE ticket_id = $1`,
@@ -51,8 +53,14 @@ exports.getTicketDetails = async (req, res) => {
             return res.status(404).json({ success: false, message: "Ticket not found" });
         }
 
-        const repliesRes = await pool.query(
-            `SELECT reply_id, admin_id, message, is_internal_note, created_at
+        // Query existing columns in ticket_replies and project is_internal_note based on sender_type
+        const repliesRes = await db.query(
+            `SELECT reply_id, 
+                    sender_id AS admin_id, 
+                    sender_type, 
+                    message, 
+                    (sender_type = 'NOTE' OR sender_type = 'INTERNAL_NOTE') AS is_internal_note, 
+                    created_at
              FROM ticket_replies
              WHERE ticket_id = $1
              ORDER BY created_at ASC`,
@@ -72,6 +80,7 @@ exports.getTicketDetails = async (req, res) => {
 
 exports.updateStatus = async (req, res) => {
     try {
+        const db = req.db || pool;
         const { id } = req.params;
         const { status } = req.body;
 
@@ -80,7 +89,7 @@ exports.updateStatus = async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid status" });
         }
 
-        const result = await pool.query(
+        const result = await db.query(
             `UPDATE support_tickets
              SET status = $1, updated_at = NOW()
              WHERE ticket_id = $2
@@ -105,25 +114,37 @@ exports.updateStatus = async (req, res) => {
 
 exports.addReply = async (req, res) => {
     try {
+        const db = req.db || pool;
         const { id } = req.params;
         const { message, is_internal_note } = req.body;
-        const adminId = req.admin?.id || null; // Assume admin id is available, fallback to null
+        const adminId = req.user?.userId || req.user?.id || req.admin?.id || null;
 
         if (!message) {
             return res.status(400).json({ success: false, message: "Message is required" });
         }
 
-        const ticketRes = await pool.query("SELECT email FROM support_tickets WHERE ticket_id = $1", [id]);
+        const ticketRes = await db.query("SELECT email FROM support_tickets WHERE ticket_id = $1", [id]);
         if (ticketRes.rowCount === 0) {
             return res.status(404).json({ success: false, message: "Ticket not found" });
         }
         const userEmail = ticketRes.rows[0].email;
 
-        const result = await pool.query(
-            `INSERT INTO ticket_replies (ticket_id, admin_id, message, is_internal_note)
+        // Ensure sender_id has a valid UUID
+        let senderId = adminId;
+        if (!senderId) {
+            const adminLookup = await db.query("SELECT admin_id FROM admin_panel_users LIMIT 1");
+            senderId = adminLookup.rows[0]?.admin_id || "00000000-0000-0000-0000-000000000000";
+        }
+
+        const senderType = is_internal_note ? "NOTE" : "ADMIN";
+
+        const result = await db.query(
+            `INSERT INTO ticket_replies (ticket_id, sender_type, sender_id, message)
              VALUES ($1, $2, $3, $4)
-             RETURNING reply_id, message, is_internal_note, created_at`,
-            [id, adminId, message, is_internal_note]
+             RETURNING reply_id, sender_id AS admin_id, sender_type, message, 
+                       (sender_type = 'NOTE' OR sender_type = 'INTERNAL_NOTE') AS is_internal_note, 
+                       created_at`,
+            [id, senderType, senderId, message]
         );
 
         if (!is_internal_note) {
