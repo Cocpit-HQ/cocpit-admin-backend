@@ -22,6 +22,7 @@ exports.globalSearch = async (req, res) => {
     let users = [];
     let organizations = [];
     let jobs = [];
+    let posts = [];
 
     if (isUUID(searchQuery)) {
       // Search by exact UUID
@@ -42,6 +43,15 @@ exports.globalSearch = async (req, res) => {
         [searchQuery]
       );
       jobs = jobResult.rows;
+
+      const postResult = await req.db.query(
+        `SELECT p.post_id, p.content, p.created_at, p.is_unlisted, u.full_name AS author, u.avatar_url
+         FROM posts p
+         JOIN users u ON p.author_id = u.user_id
+         WHERE p.post_id = $1`,
+        [searchQuery]
+      );
+      posts = postResult.rows;
     } else {
       // Search by text (ILIKE)
       const ilikeQuery = `%${searchQuery}%`;
@@ -75,12 +85,24 @@ exports.globalSearch = async (req, res) => {
         [ilikeQuery]
       );
       jobs = jobResult.rows;
+
+      const postResult = await req.db.query(
+        `SELECT p.post_id, p.content, p.created_at, p.is_unlisted, u.full_name AS author, u.avatar_url
+         FROM posts p
+         JOIN users u ON p.author_id = u.user_id
+         WHERE p.content ILIKE $1 OR p.post_id::text ILIKE $1 OR u.full_name ILIKE $1
+         ORDER BY p.created_at DESC 
+         LIMIT 10`,
+        [ilikeQuery]
+      );
+      posts = postResult.rows;
     }
 
     res.json({
       users,
       organizations,
-      jobs
+      jobs,
+      posts
     });
   } catch (err) {
     console.error('[Admin] Global Search Error:', err);
