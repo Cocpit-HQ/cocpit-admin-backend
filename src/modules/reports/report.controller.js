@@ -31,33 +31,44 @@ exports.getReports = async (req, res) => {
         whereConditions.push("r.status IN ('resolved', 'action_taken', 'dismissed', 'no_action')");
       } else {
         queryParams.push(status);
-        whereConditions.push(`r.status = ${queryParams.length}`);
+        whereConditions.push(`r.status = $${queryParams.length}`);
       }
     }
 
     if (type && type !== 'All') {
-      queryParams.push(type);
-      whereConditions.push(`r.target_type = ${queryParams.length}`);
+      if (type.toUpperCase() === 'ORGANIZATION' || type.toUpperCase() === 'COMPANY') {
+        whereConditions.push("r.target_type IN ('COMPANY', 'ORGANIZATION')");
+      } else if (type.toUpperCase() === 'CONTENT' || type.toUpperCase() === 'POST') {
+        whereConditions.push("r.target_type IN ('POST', 'Content')");
+      } else if (type.toUpperCase() === 'ACCOUNT' || type.toUpperCase() === 'USER') {
+        whereConditions.push("r.target_type = 'USER'");
+      } else if (type.toUpperCase() === 'COMMENT') {
+        whereConditions.push("r.target_type IN ('COMMENT', 'THOUGHT')");
+      } else {
+        queryParams.push(type);
+        whereConditions.push(`r.target_type = $${queryParams.length}`);
+      }
     }
     if (reason && reason !== 'All') {
       queryParams.push(reason);
-      whereConditions.push(`(r.reason = ${queryParams.length} OR rr.label = ${queryParams.length} OR r.custom_reason = ${queryParams.length})`);
+      whereConditions.push(`(r.reason = $${queryParams.length} OR rr.label = $${queryParams.length} OR r.custom_reason = $${queryParams.length})`);
     }
     if (severity && severity !== 'All') {
       queryParams.push(severity);
-      whereConditions.push(`r.severity = ${queryParams.length}`);
+      whereConditions.push(`r.severity = $${queryParams.length}`);
     }
     if (targetUserId) {
       queryParams.push(targetUserId);
       whereConditions.push(`(
-        (r.target_type = 'USER' AND r.target_id::text = ${queryParams.length}::text) OR
-        (r.target_type IN ('Content', 'POST') AND p.author_id::text = ${queryParams.length}::text) OR
-        (r.target_type IN ('COMMENT', 'THOUGHT') AND pc.author_id::text = ${queryParams.length}::text)
+        (r.target_type = 'USER' AND r.target_id::text = $${queryParams.length}::text) OR
+        (r.target_type IN ('COMPANY', 'ORGANIZATION') AND r.target_id::text = $${queryParams.length}::text) OR
+        (r.target_type IN ('Content', 'POST') AND p.author_id::text = $${queryParams.length}::text) OR
+        (r.target_type IN ('COMMENT', 'THOUGHT') AND pc.author_id::text = $${queryParams.length}::text)
       )`);
     }
     if (reporterId) {
       queryParams.push(reporterId);
-      whereConditions.push(`r.reporter_id::text = ${queryParams.length}::text`);
+      whereConditions.push(`r.reporter_id::text = $${queryParams.length}::text`);
     }
 
     let whereClause = whereConditions.length > 0 ? 'WHERE ' + whereConditions.join(' AND ') : '';
@@ -72,6 +83,7 @@ exports.getReports = async (req, res) => {
       LEFT JOIN organizations po ON p.author_org_id = po.org_id
       LEFT JOIN post_comments pc ON (r.target_type IN ('COMMENT', 'THOUGHT') AND r.target_id = pc.comment_id)
       LEFT JOIN users cu ON pc.author_id = cu.user_id
+      LEFT JOIN organizations target_o ON (r.target_type IN ('COMPANY', 'ORGANIZATION') AND r.target_id = target_o.org_id)
     `;
 
     // Get total count for pagination
@@ -86,8 +98,20 @@ exports.getReports = async (req, res) => {
         r.target_type as "rawType",
         COALESCE(r.severity, 'Tier 1 (Minor)') as severity,
         COALESCE(r.offenses, 1) as offenses,
-        COALESCE(r.content_preview, p.content, pc.content, 'Content reported') as "contentPreview",
-        (SELECT url FROM post_media pm WHERE pm.post_id::text = r.target_id::text LIMIT 1) as "image",
+        COALESCE(
+          r.content_preview, 
+          CASE 
+            WHEN r.target_type IN ('COMPANY', 'ORGANIZATION') THEN CONCAT('Company Profile: ', target_o.name, COALESCE(CONCAT(' • ', target_o.industry), ''))
+            ELSE NULL 
+          END,
+          p.content, 
+          pc.content, 
+          'Content reported'
+        ) as "contentPreview",
+        COALESCE(
+          (SELECT url FROM post_media pm WHERE pm.post_id::text = r.target_id::text LIMIT 1),
+          target_o.logo_url
+        ) as "image",
         r.created_at as "postTime",
         r.resolved_at as "resolvedAt",
         r.target_id as "postId",
@@ -98,16 +122,19 @@ exports.getReports = async (req, res) => {
         '100%' as "repScore",
         CASE 
           WHEN r.target_type = 'USER' THEN target_u.user_id
+          WHEN r.target_type IN ('COMPANY', 'ORGANIZATION') THEN target_o.org_id
           WHEN r.target_type IN ('Content', 'POST') THEN p.author_id
           WHEN r.target_type IN ('COMMENT', 'THOUGHT') THEN pc.author_id
           ELSE NULL
         END as "targetUserId",
         CASE 
           WHEN r.target_type = 'USER' THEN COALESCE(target_u.account_name, target_u.full_name)
+          WHEN r.target_type IN ('COMPANY', 'ORGANIZATION') THEN target_o.name
           WHEN r.target_type IN ('Content', 'POST') THEN COALESCE(pu.account_name, pu.full_name, po.name)
           WHEN r.target_type IN ('COMMENT', 'THOUGHT') THEN COALESCE(cu.account_name, cu.full_name)
           ELSE 'Unknown'
         END as "targetUserName",
+        target_o.slug as "targetOrgSlug",
         (SELECT url FROM post_media pm WHERE pm.post_id::text = r.target_id::text LIMIT 1) AS "postImageUrl",
         (SELECT media_type FROM post_media pm WHERE pm.post_id::text = r.target_id::text LIMIT 1) AS "postMediaType",
         (SELECT json_agg(po2.option_text) FROM post_polls pp JOIN poll_options po2 ON pp.poll_id = po2.poll_id WHERE pp.post_id::text = r.target_id::text) AS "pollOptions",
@@ -135,7 +162,7 @@ exports.getReports = async (req, res) => {
       ${baseJoin}
       ${whereClause}
       ORDER BY r.created_at DESC
-      LIMIT ${queryParams.length + 1} OFFSET ${queryParams.length + 2}
+      LIMIT $${queryParams.length + 1} OFFSET $${queryParams.length + 2}
     `;
 
     const result = await req.db.query(query, [...queryParams, limit, offset]);
@@ -184,7 +211,7 @@ exports.updateReport = async (req, res) => {
     if (noteMessage && (finalStatus === 'dismissed' || finalStatus === 'action_taken' || finalStatus === 'no_action')) {
       await req.db.query(
         'INSERT INTO report_review_notes (report_id, message, is_system, created_by) VALUES ($1, $2, false, $3)',
-        [id, noteMessage, adminId]
+        [id, noteMessage, null]
       );
     }
 
@@ -206,7 +233,7 @@ exports.getAppeals = async (req, res) => {
         'Content' as type,
         'Original Violation' as "originalViolation",
         'System' as "suspendingAdmin",
-        a.appeal_reason as "appealText",
+        COALESCE(a.reason, '') as "appealText",
         a.created_at as "appealTime"
       FROM post_appeals a
       LEFT JOIN users u ON a.user_id = u.user_id
@@ -349,7 +376,7 @@ exports.deleteReportedPost = async (req, res) => {
           id,
           postContent ? (postContent.length > 80 ? postContent.slice(0, 80) + '...' : postContent) : 'Content',
           'active',
-          adminId
+          null
         ]
       );
     }
@@ -363,7 +390,7 @@ exports.deleteReportedPost = async (req, res) => {
     for (const r of reportRes.rows) {
       await req.db.query(
         'INSERT INTO report_review_notes (report_id, message, is_system, created_by) VALUES ($1, $2, false, $3)',
-        [r.id, 'Our moderation team reviewed your report and removed the reported content for violating community guidelines.', adminId]
+        [r.id, 'Our moderation team reviewed your report and removed the reported content for violating community guidelines.', null]
       );
     }
 
@@ -407,7 +434,7 @@ exports.deleteReportedComment = async (req, res) => {
           id,
           commentContent ? (commentContent.length > 80 ? commentContent.slice(0, 80) + '...' : commentContent) : 'Comment',
           'active',
-          adminId
+          null
         ]
       );
     }
@@ -421,7 +448,7 @@ exports.deleteReportedComment = async (req, res) => {
     for (const r of reportRes.rows) {
       await req.db.query(
         'INSERT INTO report_review_notes (report_id, message, is_system, created_by) VALUES ($1, $2, false, $3)',
-        [r.id, 'Our moderation team reviewed your report and removed the reported comment for violating community guidelines.', adminId]
+        [r.id, 'Our moderation team reviewed your report and removed the reported comment for violating community guidelines.', null]
       );
     }
 
