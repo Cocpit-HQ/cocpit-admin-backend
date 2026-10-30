@@ -456,7 +456,7 @@ exports.warnUser = async (req, res) => {
         postId || id,
         postTitle || (postId ? 'Reported Content' : 'Account'),
         'active',
-        req.user.userId
+        null
       ]
     );
 
@@ -469,7 +469,7 @@ exports.warnUser = async (req, res) => {
       for (const rId of reportIds) {
         await req.db.query(
           'INSERT INTO report_review_notes (report_id, message, is_system, created_by) VALUES ($1, $2, false, $3)',
-          [rId, 'Our moderation team reviewed your report and took action: a formal warning was issued to the user.', req.user.userId]
+          [rId, 'Our moderation team reviewed your report and took action: a formal warning was issued to the user.', null]
         );
       }
     }
@@ -526,7 +526,7 @@ exports.warnUser = async (req, res) => {
           7,
           new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
           'active',
-          adminId
+          null
         ]
       );
 
@@ -552,7 +552,7 @@ exports.warnUser = async (req, res) => {
     await req.db.query(`
       INSERT INTO notifications (user_id, sender_id, type, text, reference_id, metadata)
       VALUES ($1, $2, $3, $4, $5, $6)
-    `, [id, adminId, 'user_warning', notificationText, id, JSON.stringify({ reason, message, isSevere, autoSuspended })]);
+    `, [id, null, 'user_warning', notificationText, id, JSON.stringify({ reason, message, isSevere, autoSuspended })]);
 
     socketService.notifyUser(id, "notification", {
       user_id: id,
@@ -634,7 +634,7 @@ exports.suspendUser = async (req, res) => {
         durationDays,
         suspendedUntil,
         'active',
-        adminId
+        null
       ]
     );
 
@@ -647,7 +647,7 @@ exports.suspendUser = async (req, res) => {
       for (const rId of reportIds) {
         await req.db.query(
           'INSERT INTO report_review_notes (report_id, message, is_system, created_by) VALUES ($1, $2, false, $3)',
-          [rId, 'Our moderation team reviewed your report and took action: the reported user account has been suspended.', adminId]
+          [rId, 'Our moderation team reviewed your report and took action: the reported user account has been suspended.', null]
         );
       }
     }
@@ -850,7 +850,7 @@ exports.bulkWarnUsers = async (req, res) => {
       await req.db.query(`
         INSERT INTO notifications (user_id, sender_id, type, text, reference_id, metadata)
         VALUES ($1, $2, $3, $4, $5, $6)
-      `, [id, adminId, 'user_warning', notificationText, id, JSON.stringify({ reason, message, isSevere, autoSuspended })]);
+      `, [id, null, 'user_warning', notificationText, id, JSON.stringify({ reason, message, isSevere, autoSuspended })]);
 
       socketService.notifyUser(id, "notification", {
         user_id: id,
