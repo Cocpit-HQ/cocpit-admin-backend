@@ -47,6 +47,22 @@ class SocketBridge {
       console.warn(`[SocketBridge] Notice: Could not notifyOrg:`, err.message);
     }
   }
+
+  async notifyUser(userId, event, payload) {
+    try {
+      if (redis.status === 'ready') {
+        await redis.publish('socket:events', JSON.stringify({
+          action: 'notifyUser',
+          userId,
+          event,
+          payload
+        }));
+      }
+      await httpClient.post('/socket/notify-user', { userId, event, payload }).catch(() => {});
+    } catch (err) {
+      console.warn(`[SocketBridge] Notice: Could not notifyUser for ${userId}:`, err.message);
+    }
+  }
 }
 
 module.exports = new SocketBridge();
