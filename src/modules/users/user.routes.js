@@ -8,6 +8,8 @@ router.get('/roles', requireRoles(['Admin', 'Developer']), userController.getUse
 router.get('/colleges', requireRoles(['Admin', 'Developer', 'Moderator']), userController.getColleges);
 router.get('/export-marketing-report', requireRoles(['Admin', 'Developer', 'Moderator']), reportController.exportMarketingProfilesReport);
 router.get('/', requireRoles(['Admin', 'Developer']), userController.getUsers);
+router.get('/verifications/queue', requireRoles(['Admin', 'Moderator', 'Developer']), userController.getVerificationQueue);
+router.post('/verifications/:id/review', requireRoles(['Admin', 'Moderator']), userController.reviewUserVerification);
 router.get('/:id', requireRoles(['Admin', 'Developer', 'Moderator']), userController.getUserDetails);
 router.post('/:id/warn', requireRoles(['Admin', 'Moderator']), userController.warnUser);
 router.post('/bulk-warn', requireRoles(['Admin', 'Moderator']), userController.bulkWarnUsers);

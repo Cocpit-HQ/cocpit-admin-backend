@@ -1132,3 +1132,161 @@ exports.getUserThoughts = async (req, res) => {
 
 
 
+
+
+exports.getVerificationQueue = async (req, res) => {
+  try {
+    const query = `
+      SELECT 
+        uv.verification_id as id,
+        uv.user_id,
+        uv.verification_type,
+        uv.document_type,
+        uv.front_image_url,
+        uv.back_image_url,
+        uv.is_verified,
+        uv.status,
+        uv.created_at,
+        uv.updated_at,
+        u.full_name as name,
+        u.email,
+        u.avatar_url,
+        u.is_identity_verified
+      FROM user_verifications uv
+      JOIN users u ON uv.user_id = u.user_id
+      ORDER BY uv.created_at DESC
+    `;
+    const result = await req.db.query(query);
+    const verifications = result.rows.map(item => {
+      let displayStatus = 'Under Review';
+      let badgeColor = 'bg-amber-500';
+      if (item.is_verified || item.status === 'VERIFIED') {
+        displayStatus = 'Approved';
+        badgeColor = 'bg-emerald-600';
+      } else if (item.status === 'REJECTED') {
+        displayStatus = 'Rejected';
+        badgeColor = 'bg-rose-600';
+      } else {
+        displayStatus = 'Under Review';
+        badgeColor = 'bg-amber-500';
+      }
+
+      return {
+        ...item,
+        status: displayStatus,
+        statusBadgeColor: badgeColor,
+      };
+    });
+
+    res.json(verifications);
+  } catch (err) {
+    console.error('Error in user getVerificationQueue:', err);
+    res.status(500).json({ error: 'Failed to fetch user verification queue' });
+  }
+};
+
+exports.reviewUserVerification = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, notes, rejectionReason } = req.body;
+    const adminId = req.user.userId;
+
+    if (!['VERIFIED', 'REJECTED'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid verification status. Must be VERIFIED or REJECTED' });
+    }
+
+    const { createAuditLog } = require('../../middlewares/auditLog.middleware');
+    const client = await req.db.connect();
+    try {
+      await client.query('BEGIN');
+
+      if (adminId) {
+        await client.query(`
+          INSERT INTO users (user_id, full_name, email, auth_provider, password_hash)
+          VALUES ($1, 'Admin', 'admin@cocpit.ai', 'admin', 'N/A')
+          ON CONFLICT (user_id) DO NOTHING
+        `, [adminId]);
+      }
+
+      const verifRes = await client.query(
+        `SELECT uv.*, u.full_name, u.email 
+         FROM user_verifications uv 
+         JOIN users u ON uv.user_id = u.user_id 
+         WHERE uv.verification_id = $1`,
+        [id]
+      );
+
+      if (verifRes.rows.length === 0) {
+        throw new Error('Verification record not found');
+      }
+
+      const record = verifRes.rows[0];
+      const targetUserId = record.user_id;
+      const userName = record.full_name || 'User';
+
+      const isVerified = status === 'VERIFIED';
+      const fullNotes = rejectionReason ? `[Reason: ${rejectionReason}] ${notes || ''}` : notes;
+
+      // 1. Update user_verifications
+      await client.query(
+        `UPDATE user_verifications 
+         SET is_verified = $1, status = $2, updated_at = NOW() 
+         WHERE verification_id = $3`,
+        [isVerified, status, id]
+      );
+
+      // 2. Update users table
+      await client.query(
+        `UPDATE users 
+         SET is_identity_verified = $1, updated_at = NOW() 
+         WHERE user_id = $2`,
+        [isVerified, targetUserId]
+      );
+
+      // 3. Log audit
+      await client.query(
+        'INSERT INTO admin_audit_logs (user_id, action_type, description) VALUES ($1, $2, $3)',
+        [adminId, `USER_VERIFICATION_${status}`, `Verification review for user "${userName}" (${targetUserId}): ${status}. Notes: ${fullNotes || 'None'}`]
+      );
+      await createAuditLog(adminId, `USER_VERIFICATION_${status}`, `Verification review for user "${userName}": ${status}. Notes: ${fullNotes || 'None'}`);
+
+      // 4. Send notification
+      const notificationText = isVerified
+        ? 'Your identity verification has been approved! You are now verified on Cocpit.'
+        : `Your identity verification was not approved. ${rejectionReason ? `Reason: ${rejectionReason}` : ''}`;
+
+      await client.query(
+        `INSERT INTO notifications (user_id, sender_id, type, text, reference_id, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [targetUserId, adminId, 'user_identity_verification', notificationText, id, JSON.stringify({ verificationId: id, status, rejectionReason })]
+      );
+
+      if (socketService) {
+        socketService.notifyUser(targetUserId, "notification", {
+          user_id: targetUserId,
+          type: 'user_identity_verification',
+          text: notificationText,
+          reference_id: id,
+          created_at: new Date()
+        });
+      }
+
+      await client.query('COMMIT');
+
+      res.json({
+        success: true,
+        message: `User verification ${status.toLowerCase()} successfully`,
+        status,
+        userId: targetUserId
+      });
+    } catch (dbErr) {
+      await client.query('ROLLBACK');
+      throw dbErr;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Error in reviewUserVerification:', err);
+    res.status(500).json({ error: 'Failed to complete user verification review', details: err.message });
+  }
+};
