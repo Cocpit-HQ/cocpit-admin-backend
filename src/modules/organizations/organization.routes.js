@@ -7,6 +7,7 @@ router.get('/', requireRoles(['Admin', 'Moderator', 'Developer']), organizationC
 router.get('/industries', requireRoles(['Admin', 'Moderator', 'Developer']), organizationController.getOrganizationIndustries);
 router.get('/verifications/queue', requireRoles(['Admin', 'Moderator', 'Developer']), organizationController.getVerificationQueue);
 router.get('/:id', requireRoles(['Admin', 'Moderator', 'Developer']), organizationController.getOrganizationDetails);
+router.post('/:id/submit-verification', requireRoles(['Admin', 'Moderator', 'Developer']), organizationController.submitOrganizationVerification);
 router.post('/verifications/documents/:documentId/review', requireRoles(['Admin', 'Moderator']), organizationController.reviewDocument);
 router.post('/verifications/:id/review', requireRoles(['Admin', 'Moderator']), organizationController.reviewOrganizationVerification);
 router.post('/:id/warn', requireRoles(['Admin', 'Moderator']), organizationController.warnOrganization);
