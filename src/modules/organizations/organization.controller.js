@@ -7,12 +7,12 @@ exports.getOrganizations = async (req, res) => {
     const { search = '', status = 'All', industry = 'All', page = 1, limit = 8 } = req.query;
     const offset = (page - 1) * limit;
 
-    let query = 'SELECT org_id as id, name, slug, email, website, industry, location, is_suspended, created_at FROM organizations WHERE is_deleted = false';
+    let query = 'SELECT org_id as id, name, legal_name, incorporation_date, verification_status, logo_url, slug, email, website, industry, location, is_suspended, created_at FROM organizations WHERE is_deleted = false';
     const params = [];
 
     if (search) {
       params.push(`%${search}%`);
-      query += ` AND (name ILIKE $${params.length} OR email ILIKE $${params.length} OR website ILIKE $${params.length})`;
+      query += ` AND (name ILIKE $${params.length} OR email ILIKE $${params.length} OR website ILIKE $${params.length} OR legal_name ILIKE $${params.length})`;
     }
 
     if (status !== 'All') {
@@ -36,6 +36,10 @@ exports.getOrganizations = async (req, res) => {
     const organizations = orgsRes.rows.map(org => ({
       id: org.id,
       name: org.name || 'Unnamed Org',
+      legal_name: org.legal_name || org.name || '',
+      incorporation_date: org.incorporation_date ? new Date(org.incorporation_date).toISOString().split('T')[0] : null,
+      verification_status: org.verification_status || 'UNVERIFIED',
+      logo_url: org.logo_url || null,
       slug: org.slug,
       email: org.email,
       website: org.website || 'N/A',
@@ -65,7 +69,7 @@ exports.getOrganizationDetails = async (req, res) => {
     
     // Fetch organization core details
     const orgQuery = `
-      SELECT org_id as id, name, slug, email, website, industry, location, description, 
+      SELECT org_id as id, name, legal_name, incorporation_date, slug, email, website, industry, location, description, 
              verification_status, review_notes, moderation_flags, is_suspended, created_at,
              parent_org_id, size, slogan, logo_url, cover_url
       FROM organizations 
@@ -125,6 +129,10 @@ exports.getOrganizationDetails = async (req, res) => {
     const orgProfile = {
       org_id: org.id,
       name: org.name || 'Unnamed Org',
+      legal_name: org.legal_name || org.name || '',
+      incorporation_date: org.incorporation_date ? new Date(org.incorporation_date).toISOString().split('T')[0] : null,
+      verification_status: org.verification_status || 'UNVERIFIED',
+      logo_url: org.logo_url || null,
       slug: org.slug,
       email: org.email,
       website: org.website || 'N/A',
@@ -305,7 +313,7 @@ exports.getOrganizationIndustries = async (req, res) => {
 exports.getVerificationQueue = async (req, res) => {
   try {
     const query = `
-      SELECT o.org_id as id, o.name as title, o.verification_status, o.created_at,
+      SELECT o.org_id as id, o.name as title, o.legal_name, o.incorporation_date, o.logo_url, o.verification_status, o.created_at,
              o.location, o.industry as type, o.size as salary, o.entity_type as mode, o.description,
              o.review_notes, u.full_name as author, ov.verification_id
       FROM organizations o
@@ -340,6 +348,8 @@ exports.getVerificationQueue = async (req, res) => {
       }
       
       org.date = org.created_at ? new Date(org.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
+      org.legal_name = org.legal_name || org.title || '';
+      org.incorporation_date = org.incorporation_date ? new Date(org.incorporation_date).toISOString().split('T')[0] : '';
       org.fullLocation = org.location || 'N/A';
       org.author = org.author || 'N/A';
       
@@ -440,6 +450,14 @@ exports.reviewOrganizationVerification = async (req, res) => {
          WHERE org_id = $4 AND is_verified = false`,
         [status === 'VERIFIED', adminId, fullNotes, id]
       );
+      
+      if (status === 'REJECTED') {
+        // Automatically pause any active jobs posted by this organization
+        await client.query(
+          `UPDATE jobs SET status = 'PAUSED', is_active = false WHERE org_id = $1 AND status = 'ACTIVE'`,
+          [id]
+        );
+      }
       
       await client.query(
         'INSERT INTO admin_audit_logs (user_id, action_type, description) VALUES ($1, $2, $3)',
@@ -620,5 +638,115 @@ exports.bulkUnsuspendOrganizations = async (req, res) => {
   } catch (error) {
     console.error('Error unsuspending organizations in bulk:', error);
     res.status(500).json({ error: 'Failed to unsuspend organizations in bulk' });
+  }
+};
+
+
+exports.submitOrganizationVerification = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { legal_name, incorporation_date, document_url, document_name, document_type = 'CERTIFICATE_OF_INCORPORATION' } = req.body;
+    const adminId = req.user?.userId;
+
+    if (!legal_name || !legal_name.trim()) {
+      return res.status(400).json({ error: 'Organization legal full name is required' });
+    }
+    if (!incorporation_date) {
+      return res.status(400).json({ error: 'Incorporation date is required' });
+    }
+
+    const client = await req.db.connect();
+    try {
+      await client.query('BEGIN');
+
+      // 1. Update organizations table
+      const updateOrgQuery = `
+        UPDATE organizations
+        SET legal_name = $1,
+            incorporation_date = $2,
+            verification_status = 'UNDER_REVIEW',
+            updated_at = NOW()
+        WHERE org_id = $3 AND is_deleted = false
+        RETURNING name, slug, logo_url, created_by
+      `;
+      const orgRes = await client.query(updateOrgQuery, [legal_name.trim(), incorporation_date, id]);
+      if (orgRes.rows.length === 0) {
+        throw new Error('Organization not found');
+      }
+      const org = orgRes.rows[0];
+
+      // 2. Insert into organization_documents if document provided
+      let docRecord = null;
+      if (document_url) {
+        const docName = document_name || `${legal_name.trim()}_Verification_Document`;
+        const insertDocQuery = `
+          INSERT INTO organization_documents (org_id, document_url, document_name, document_type, uploaded_at)
+          VALUES ($1, $2, $3, $4, NOW())
+          RETURNING document_id, document_url, document_name
+        `;
+        const docRes = await client.query(insertDocQuery, [id, document_url, docName, document_type]);
+        docRecord = docRes.rows[0];
+      }
+
+      // 3. Insert or update organization_verifications tracking
+      const insertVerifQuery = `
+        INSERT INTO organization_verifications (
+          org_id, user_id, verification_type, legal_name, incorporation_date, document_urls, document_type, is_verified, created_at
+        ) VALUES (
+          $1, $2, 'DOCUMENT', $3, $4, $5, $6, false, NOW()
+        )
+        RETURNING verification_id
+      `;
+      await client.query(insertVerifQuery, [
+        id,
+        org.created_by || adminId,
+        legal_name.trim(),
+        incorporation_date,
+        document_url || null,
+        document_type
+      ]);
+
+      // 4. Log audit action
+      if (adminId) {
+        await client.query(
+          'INSERT INTO admin_audit_logs (user_id, action_type, description) VALUES ($1, $2, $3)',
+          [adminId, 'ORG_VERIFICATION_SUBMITTED', `Submitted verification credentials for organization "${org.name}": Legal Name: ${legal_name}, Inc. Date: ${incorporation_date}`]
+        );
+      }
+
+      await client.query('COMMIT');
+
+      // Publish Redis event for real-time awareness
+      try {
+        await redis.publish('admin:organizations', JSON.stringify({
+          action: 'verification_submitted',
+          orgId: id,
+          legal_name: legal_name.trim(),
+          status: 'UNDER_REVIEW'
+        }));
+      } catch (rErr) {
+        console.warn('Redis pub/sub notification skipped:', rErr.message);
+      }
+
+      res.json({
+        message: 'Organization verification submitted successfully',
+        org: {
+          id,
+          name: org.name,
+          legal_name: legal_name.trim(),
+          incorporation_date,
+          verification_status: 'UNDER_REVIEW',
+          document: docRecord
+        }
+      });
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error('Error submitting organization verification:', error);
+    res.status(500).json({ error: error.message || 'Failed to submit organization verification' });
   }
 };
