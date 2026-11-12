@@ -1,9 +1,6 @@
 const Redis = require('ioredis');
 
-const redis = new Redis({
-  host: process.env.REDIS_HOST || 'localhost',
-  port: process.env.REDIS_PORT ? Number(process.env.REDIS_PORT) : 6379,
-  db: parseInt(process.env.REDIS_DB || '0', 10),
+const redisOptions = {
   maxRetriesPerRequest: 0,
   enableOfflineQueue: false,
   retryStrategy(times) {
@@ -15,7 +12,20 @@ const redis = new Redis({
     }
     return false;
   },
-});
+};
+
+let redis;
+if (process.env.REDIS_URL) {
+  redis = new Redis(process.env.REDIS_URL, redisOptions);
+} else {
+  redis = new Redis({
+    host: process.env.REDIS_HOST || 'localhost',
+    port: process.env.REDIS_PORT ? Number(process.env.REDIS_PORT) : 6379,
+    password: process.env.REDIS_PASSWORD || undefined,
+    db: parseInt(process.env.REDIS_DB || '0', 10),
+    ...redisOptions,
+  });
+}
 
 redis.setEx = async (key, seconds, value) => {
   return redis.set(key, value, 'EX', seconds);

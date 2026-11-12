@@ -58,10 +58,12 @@ const login = async (req, res) => {
       [user.admin_id, tokenHash]
     );
 
+    const isProductionLike = process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'staging';
+
     res.cookie('refreshToken', refreshToken, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'staging',
-      sameSite: 'strict',
+      secure: isProductionLike,
+      sameSite: isProductionLike ? 'none' : 'lax',
       maxAge: 24 * 60 * 60 * 1000 // 24 hours
     });
 
@@ -130,10 +132,12 @@ const logout = async (req, res) => {
     const userId = dbTokenResult.rows[0]?.admin_id;
 
     await req.db.query('UPDATE admin_refresh_tokens SET is_revoked = true WHERE token_hash = $1', [tokenHash]);
+    const isProductionLike = process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'staging';
+
     res.clearCookie('refreshToken', {
       httpOnly: true,
-      sameSite: 'strict',
-      secure: process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'staging'
+      sameSite: isProductionLike ? 'none' : 'lax',
+      secure: isProductionLike
     });
     res.status(200).json({ message: 'Logged out successfully' });
 
