@@ -218,7 +218,7 @@ exports.getUserDetails = async (req, res) => {
              location_formatted, location_city, location_state, location_country, location,
              location_lat, location_lng,
              avatar_url, created_at, user_type, is_suspended, is_deleted, last_active_at, moderation_flags,
-             suspension_count, is_onboarding_complete, onboarding_step
+             suspension_count, is_onboarding_complete, onboarding_step, is_identity_verified
       FROM users WHERE user_id = $1
     `;
     const userResult = await req.db.query(userQuery, [id]);
@@ -227,6 +227,31 @@ exports.getUserDetails = async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
     const user = userResult.rows[0];
+
+    // 1b. Verification Status
+    let latestVerif = null;
+    let verificationStatus = user.is_identity_verified ? 'Verified' : 'Unverified';
+    try {
+      const verifResult = await req.db.query(
+        `SELECT verification_id, status, is_verified, document_type, rejection_reason, created_at 
+         FROM user_verifications 
+         WHERE user_id = $1 
+         ORDER BY created_at DESC LIMIT 1`,
+        [id]
+      );
+      if (verifResult.rows.length > 0) {
+        latestVerif = verifResult.rows[0];
+        if (latestVerif.is_verified || latestVerif.status === 'VERIFIED') {
+          verificationStatus = 'Verified';
+        } else if (latestVerif.status === 'REJECTED') {
+          verificationStatus = 'Rejected';
+        } else if (latestVerif.status === 'PENDING' || latestVerif.status === 'UNDER_REVIEW') {
+          verificationStatus = 'Under Review';
+        }
+      }
+    } catch (verifErr) {
+      console.error('Warning: could not fetch verification status for user details:', verifErr.message);
+    }
 
     // 2. Stats
     const statsQuery = `
@@ -381,6 +406,15 @@ exports.getUserDetails = async (req, res) => {
       role: role,
       isOnboardingComplete: Boolean(user.is_onboarding_complete),
       onboardingStep: user.onboarding_step,
+      isIdentityVerified: Boolean(user.is_identity_verified || verificationStatus === 'Verified'),
+      verification: {
+        isVerified: Boolean(user.is_identity_verified || verificationStatus === 'Verified'),
+        status: verificationStatus,
+        verificationId: latestVerif?.verification_id || null,
+        documentType: latestVerif?.document_type || null,
+        rejectionReason: latestVerif?.rejection_reason || null,
+        submittedAt: latestVerif?.created_at || null
+      },
       stats: {
         posts: parseInt(stats.posts_count),
         followers: parseInt(stats.followers_count),
@@ -1137,24 +1171,36 @@ exports.getUserThoughts = async (req, res) => {
 exports.getVerificationQueue = async (req, res) => {
   try {
     const query = `
+      WITH user_verifs AS (
+        SELECT 
+          COALESCE(uv.verification_id, u.user_id) as id,
+          u.user_id,
+          COALESCE(uv.verification_type, 'IDENTITY') as verification_type,
+          COALESCE(uv.document_type, 'NATIONAL_ID') as document_type,
+          uv.front_image_url,
+          uv.back_image_url,
+          uv.rejection_reason,
+          uv.notes,
+          COALESCE(uv.is_verified, u.is_identity_verified, false) as is_verified,
+          COALESCE(uv.status, CASE WHEN u.is_identity_verified THEN 'VERIFIED' ELSE 'PENDING' END) as status,
+          COALESCE(uv.created_at, u.created_at) as created_at,
+          COALESCE(uv.updated_at, u.updated_at, u.created_at) as updated_at,
+          u.full_name as name,
+          u.email,
+          u.avatar_url,
+          u.is_identity_verified,
+          ROW_NUMBER() OVER (PARTITION BY u.user_id ORDER BY COALESCE(uv.created_at, u.created_at) DESC) as rn
+        FROM users u
+        LEFT JOIN user_verifications uv ON uv.user_id = u.user_id
+        WHERE uv.verification_id IS NOT NULL OR u.is_identity_verified = true
+      )
       SELECT 
-        uv.verification_id as id,
-        uv.user_id,
-        uv.verification_type,
-        uv.document_type,
-        uv.front_image_url,
-        uv.back_image_url,
-        uv.is_verified,
-        uv.status,
-        uv.created_at,
-        uv.updated_at,
-        u.full_name as name,
-        u.email,
-        u.avatar_url,
-        u.is_identity_verified
-      FROM user_verifications uv
-      JOIN users u ON uv.user_id = u.user_id
-      ORDER BY uv.created_at DESC
+        id, user_id, verification_type, document_type, front_image_url, back_image_url,
+        rejection_reason, notes, is_verified, status, created_at, updated_at,
+        name, email, avatar_url, is_identity_verified
+      FROM user_verifs 
+      WHERE rn = 1
+      ORDER BY created_at DESC
     `;
     const result = await req.db.query(query);
     const verifications = result.rows.map(item => {
@@ -1208,32 +1254,45 @@ exports.reviewUserVerification = async (req, res) => {
         `, [adminId]);
       }
 
-      const verifRes = await client.query(
+      let verifRes = await client.query(
         `SELECT uv.*, u.full_name, u.email 
          FROM user_verifications uv 
          JOIN users u ON uv.user_id = u.user_id 
-         WHERE uv.verification_id = $1`,
+         WHERE uv.verification_id = $1 OR uv.user_id = $1`,
         [id]
       );
-
-      if (verifRes.rows.length === 0) {
-        throw new Error('Verification record not found');
-      }
-
-      const record = verifRes.rows[0];
-      const targetUserId = record.user_id;
-      const userName = record.full_name || 'User';
 
       const isVerified = status === 'VERIFIED';
       const fullNotes = rejectionReason ? `[Reason: ${rejectionReason}] ${notes || ''}` : notes;
 
-      // 1. Update user_verifications
-      await client.query(
-        `UPDATE user_verifications 
-         SET is_verified = $1, status = $2, updated_at = NOW() 
-         WHERE verification_id = $3`,
-        [isVerified, status, id]
-      );
+      let record;
+      if (verifRes.rows.length === 0) {
+        // User was verified directly in users table. Create the verification record now:
+        const userCheck = await client.query('SELECT user_id, full_name, email FROM users WHERE user_id = $1', [id]);
+        if (userCheck.rows.length === 0) {
+          throw new Error('Verification record not found');
+        }
+        const u = userCheck.rows[0];
+        const inserted = await client.query(
+          `INSERT INTO user_verifications (user_id, verification_type, document_type, is_verified, status, rejection_reason, notes)
+           VALUES ($1, 'IDENTITY', 'NATIONAL_ID', $2, $3, $4, $5)
+           RETURNING *`,
+          [u.user_id, isVerified, status, rejectionReason || null, notes || null]
+        );
+        record = { ...inserted.rows[0], full_name: u.full_name, email: u.email };
+      } else {
+        record = verifRes.rows[0];
+        // 1. Update user_verifications
+        await client.query(
+          `UPDATE user_verifications 
+           SET is_verified = $1, status = $2, rejection_reason = $3, notes = $4, updated_at = NOW() 
+           WHERE verification_id = $5`,
+          [isVerified, status, rejectionReason || null, notes || null, record.verification_id]
+        );
+      }
+
+      const targetUserId = record.user_id;
+      const userName = record.full_name || 'User';
 
       // 2. Update users table
       await client.query(
@@ -1242,6 +1301,16 @@ exports.reviewUserVerification = async (req, res) => {
          WHERE user_id = $2`,
         [isVerified, targetUserId]
       );
+
+      // 2b. If rejected or revoked from approved, automatically pause any active personal jobs posted by this user
+      if (!isVerified) {
+        await client.query(
+          `UPDATE jobs 
+           SET status = 'PAUSED', is_active = false, updated_at = NOW() 
+           WHERE recruiter_id = $1 AND org_id IS NULL AND status = 'ACTIVE'`,
+          [targetUserId]
+        );
+      }
 
       // 3. Log audit
       await client.query(

@@ -102,7 +102,7 @@ exports.moderateJob = async (req, res) => {
       modStatusVal = 'APPROVED';
       logAction = 'APPROVE_JOB';
     } else {
-      statusVal = 'CLOSED';
+      statusVal = 'REJECTED';
       modStatusVal = 'REJECTED';
       logAction = 'REJECT_JOB';
     }
@@ -113,7 +113,7 @@ exports.moderateJob = async (req, res) => {
       WHERE job_id = $4
       RETURNING *
     `;
-    const isActive = (modStatusVal === 'APPROVED');
+    const isActive = true;
     const result = await req.db.query(query, [statusVal, modStatusVal, isActive, id, rejection_reason]);
 
     if (result.rows.length === 0) {
@@ -128,6 +128,33 @@ exports.moderateJob = async (req, res) => {
       logAction,
       `Moderated job "${job.title}" by "${job.company_name}": status set to ${modStatusVal}`
     );
+
+    // Dispatch In-App Notification to Recruiter
+    try {
+      const isApproved = modStatusVal === 'APPROVED';
+      const notificationText = isApproved
+        ? `Your job posting "${job.title}" has been approved and is now live!`
+        : `Your job posting "${job.title}" was not approved. Reason: ${rejection_reason || 'Please review posting guidelines'}.`;
+
+      const notifType = isApproved ? 'job_moderation_approved' : 'job_moderation_rejected';
+
+      if (job.recruiter_id) {
+        await req.db.query(
+          `INSERT INTO notifications (user_id, sender_id, type, text, reference_id, metadata)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            job.recruiter_id,
+            req.user?.userId || null,
+            notifType,
+            notificationText,
+            job.job_id,
+            JSON.stringify({ jobId: job.job_id, title: job.title, moderation_status: modStatusVal, rejection_reason })
+          ]
+        );
+      }
+    } catch (notifErr) {
+      console.warn('Notification dispatch failed for job moderation:', notifErr.message);
+    }
 
     res.json({
       message: `Job successfully ${modStatusVal.toLowerCase()}`,
