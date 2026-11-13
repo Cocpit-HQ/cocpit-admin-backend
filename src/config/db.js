@@ -3,18 +3,18 @@ const { Pool } = require('pg');
 const isProduction = process.env.NODE_ENV === 'production';
 
 const getPoolConfig = (host, port, user, password, dbName) => {
-  const hostVal = host || process.env.DB_HOST || '192.168.1.50';
+  const hostVal = host || process.env.DB_HOST || 'caboose.proxy.rlwy.net';
   const isLocalHost = hostVal === 'localhost' || hostVal.startsWith('127.') || hostVal.startsWith('192.168.');
   const enableSsl = process.env.DB_SSL !== undefined 
     ? process.env.DB_SSL === 'true' 
-    : (isProduction && !isLocalHost);
+    : (isProduction || !isLocalHost);
 
   return {
     host: hostVal,
-    port: port ? Number(port) : (process.env.DB_PORT ? Number(process.env.DB_PORT) : 5432),
-    user: user || process.env.DB_USER || 'sanika',
-    password: password || process.env.DB_PASSWORD || 'cocpit@4713',
-    database: dbName || process.env.DB_NAME || 'cocpit_backend_uat',
+    port: port ? Number(port) : (process.env.DB_PORT ? Number(process.env.DB_PORT) : 26518),
+    user: user || process.env.DB_USER || 'postgres',
+    password: password || process.env.DB_PASSWORD || 'sSWdEpqkZHkmXYEQUELDCXzXlooxyBAC',
+    database: dbName || process.env.DB_NAME || 'railway',
     max: 20,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
@@ -32,7 +32,10 @@ function getPool(environment) {
   if (pools[env]) return pools[env];
 
   let pool;
-  if (process.env.DATABASE_URL && !process.env.DB_HOST) {
+  if (process.env.DATABASE_URL) {
+    const isCloudDb = process.env.DATABASE_URL.includes('.rlwy.net') || 
+                      process.env.DATABASE_URL.includes('railway') || 
+                      isProduction;
     pool = new Pool({
       connectionString: process.env.DATABASE_URL,
       max: 20,
@@ -40,7 +43,7 @@ function getPool(environment) {
       connectionTimeoutMillis: 5000,
       statement_timeout: 60000,
       query_timeout: 60000,
-      ssl: process.env.DB_SSL === 'false' ? false : { rejectUnauthorized: false },
+      ssl: process.env.DB_SSL === 'false' ? false : (isCloudDb ? { rejectUnauthorized: false } : false),
     });
   } else {
     let dbName = process.env.DB_NAME || 'cocpit_backend_uat';
